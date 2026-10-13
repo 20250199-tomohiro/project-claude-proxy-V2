@@ -653,6 +653,10 @@ function shellMain() {
 
   var q = new URLSearchParams(location.search).get('u');
   var start = q && /^\/go\/https?\/[^\/]/.test(q) ? q : '/';
+  // 外側ページのURLは常に「/」に固定 (開いているサイトによって変わらない)
+  try {
+    history.replaceState(null, '', '/');
+  } catch (e) {}
   ensureSW().then(function () {
     fr.src = start;
   });
