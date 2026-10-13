@@ -663,7 +663,7 @@ const SHELL_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Web Proxy</title>
+<title>Data Center</title>
 <style>
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;background:#0f1117}
@@ -695,7 +695,7 @@ const INDEX_HTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Web Proxy</title>
+<title>Data Center</title>
 <style>
   :root{color-scheme:dark}
   *{box-sizing:border-box}
