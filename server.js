@@ -449,6 +449,9 @@ function indexMain() {
   var inp = document.getElementById('u');
   var chk = document.getElementById('c');
   var st = document.getElementById('s');
+  // ナビバー内 (iframe) で開かれたトップページでは、履歴なしチェックを隠してそのまま遷移する
+  var framed = window.top !== window;
+  if (framed) chk.parentNode.style.display = 'none';
 
   try {
     chk.checked = localStorage.getItem('px_cloak') === '1';
@@ -514,7 +517,7 @@ function indexMain() {
       return;
     }
     var w = null;
-    if (chk.checked) {
+    if (chk.checked && !framed) {
       // ユーザー操作の直後に同期的に開く (ポップアップブロック回避)
       w = window.open('about:blank', '_blank');
       if (!w) {
@@ -525,7 +528,8 @@ function indexMain() {
     st.textContent = '準備中...';
     ensureSW()
       .then(function () {
-        var full = location.origin + path;
+        var shell = '/~/shell?u=' + encodeURIComponent(path);
+        var full = location.origin + shell;
         if (w) {
           var d = w.document;
           d.open();
@@ -539,7 +543,7 @@ function indexMain() {
           d.close();
           st.textContent = '別タブ (about:blank) で開きました';
         } else {
-          location.href = path;
+          location.href = framed ? path : shell;
         }
       })
       .catch(function (e) {
@@ -555,6 +559,136 @@ function indexMain() {
 
 const SW_JS = '(' + swMain.toString() + ')();';
 const CLIENT_JS = '(' + clientMain.toString() + ')();';
+
+/* ---------- ナビゲーションバー付きの表示ページ (/~/shell) ---------- */
+function shellMain() {
+  var fr = document.getElementById('fr');
+  var a = document.getElementById('a');
+  var RX = /^\/go\/(https?)\/([^\/?#]+)(\/[^?#]*)?/;
+
+  function normalize(v) {
+    v = v.trim();
+    if (!v) return null;
+    if (/^https?:\/\//i.test(v)) return v;
+    if (
+      !/\s/.test(v) &&
+      (/^[^\s\/?#:.]+(\.[^\s\/?#:.]+)+(:\d+)?([\/?#]\S*)?$/.test(v) || /^localhost(:\d+)?([\/?#]\S*)?$/i.test(v))
+    ) {
+      return 'https://' + v;
+    }
+    return 'https://duckduckgo.com/?q=' + encodeURIComponent(v);
+  }
+  function toPath(u) {
+    var x = new URL(u);
+    return '/go/' + x.protocol.slice(0, -1) + '/' + x.host + x.pathname + x.search + x.hash;
+  }
+  function ensureSW() {
+    if (!('serviceWorker' in navigator)) return Promise.resolve();
+    return navigator.serviceWorker
+      .register('/sw.js', { scope: '/' })
+      .then(function () {
+        return navigator.serviceWorker.ready;
+      })
+      .then(function () {
+        if (navigator.serviceWorker.controller) return;
+        return new Promise(function (resolve) {
+          var done = false;
+          function fin() {
+            if (!done) {
+              done = true;
+              resolve();
+            }
+          }
+          navigator.serviceWorker.addEventListener('controllerchange', fin);
+          setTimeout(fin, 2000);
+        });
+      });
+  }
+
+  // iframe 内の現在のページを、元のURLとして入力欄に表示
+  function show() {
+    try {
+      if (document.activeElement === a) return;
+      var l = fr.contentWindow.location;
+      var m = RX.exec(l.pathname);
+      var t = m ? m[1] + '://' + m[2] + (m[3] || '/') + l.search + l.hash : '';
+      if (a.value !== t) a.value = t;
+    } catch (e) {}
+  }
+  setInterval(show, 500);
+  fr.addEventListener('load', show);
+
+  function hist(fn) {
+    try {
+      fn(fr.contentWindow);
+    } catch (e) {}
+  }
+  document.getElementById('b').addEventListener('click', function () {
+    hist(function (w) {
+      w.history.back();
+    });
+  });
+  document.getElementById('n').addEventListener('click', function () {
+    hist(function (w) {
+      w.history.forward();
+    });
+  });
+  document.getElementById('r').addEventListener('click', function () {
+    hist(function (w) {
+      w.location.reload();
+    });
+  });
+  document.getElementById('h').addEventListener('click', function () {
+    fr.src = '/';
+  });
+  a.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'Enter') return;
+    var url = normalize(a.value);
+    if (!url) return;
+    try {
+      fr.src = toPath(url);
+      a.blur();
+    } catch (e) {}
+  });
+
+  var q = new URLSearchParams(location.search).get('u');
+  var start = q && /^\/go\/https?\/[^\/]/.test(q) ? q : '/';
+  ensureSW().then(function () {
+    fr.src = start;
+  });
+}
+
+const SHELL_HTML = `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Web Proxy</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#0f1117}
+  #bar{position:fixed;top:0;left:0;right:0;height:44px;display:flex;gap:6px;align-items:center;padding:6px 8px;
+       background:#171a23;border-bottom:1px solid #2b3040;font-family:system-ui,sans-serif}
+  #bar button{width:34px;height:32px;border:0;border-radius:8px;background:#242938;color:#e8eaf0;font-size:16px;cursor:pointer;flex:none}
+  #bar button:hover{background:#2f3550}
+  #a{flex:1;min-width:0;height:32px;padding:0 14px;border-radius:16px;border:1px solid #2b3040;background:#0f1117;
+     color:#e8eaf0;font-size:14px;outline:none}
+  #a:focus{border-color:#5b8cff}
+  #fr{position:fixed;top:44px;left:0;right:0;bottom:0;width:100%;height:calc(100% - 44px);border:0;background:#fff}
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="b" title="戻る">&#8592;</button>
+  <button id="n" title="進む">&#8594;</button>
+  <button id="r" title="再読み込み">&#10227;</button>
+  <button id="h" title="ホーム">&#8962;</button>
+  <input id="a" type="text" placeholder="URL または検索ワードを入力" autocomplete="off" spellcheck="false">
+</div>
+<iframe id="fr" allow="fullscreen; autoplay; clipboard-read; clipboard-write" allowfullscreen></iframe>
+<script>(${shellMain.toString()})();</script>
+</body>
+</html>`;
 
 const INDEX_HTML = `<!doctype html>
 <html lang="ja">
@@ -1157,6 +1291,10 @@ const server = http.createServer(async (req, res) => {
     if (path === '/~/client.js') {
       res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8', 'cache-control': 'no-cache' });
       return res.end(CLIENT_JS);
+    }
+    if (path === '/~/shell') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
+      return res.end(SHELL_HTML);
     }
     if (path === '/~/cookie' && req.method === 'POST') {
       const body = JSON.parse((await readBody(req, 16384)) || '{}');
