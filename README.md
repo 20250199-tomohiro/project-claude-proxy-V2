@@ -11,6 +11,6 @@
     npm install
     npm start   # http://localhost:3000
 
-##本家サイト
+## 本家サイト
 https://project-claude-proxy-v2.onrender.com/
 (パスワードがかかっているので、使いたい人は直接言うか自分でデプロイしてね☆)
