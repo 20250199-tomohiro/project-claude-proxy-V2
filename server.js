@@ -668,6 +668,7 @@ const SHELL_HTML = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Data Center</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;background:#0f1117}
@@ -694,12 +695,22 @@ const SHELL_HTML = `<!doctype html>
 </body>
 </html>`;
 
+/* ---------- ファビコン (黒背景 / 蛍光グリーンの ≫ / 白の _) ---------- */
+const FAVICON_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">' +
+  '<rect width="64" height="64" rx="12" fill="#000"/>' +
+  '<g fill="none" stroke="#39ff14" stroke-width="6" stroke-linecap="round" stroke-linejoin="round">' +
+  '<polyline points="10,18 24,32 10,46"/><polyline points="24,18 38,32 24,46"/></g>' +
+  '<line x1="42" y1="48" x2="56" y2="48" stroke="#fff" stroke-width="6" stroke-linecap="round"/>' +
+  '</svg>';
+
 const INDEX_HTML = `<!doctype html>
 <html lang="ja">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Data Center</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
   :root{color-scheme:dark}
   *{box-sizing:border-box}
@@ -723,9 +734,9 @@ const INDEX_HTML = `<!doctype html>
 </head>
 <body>
 <main>
-  <h1>Web Proxy</h1>
+  <h1>Data Center</h1>
   <form id="f" autocomplete="off">
-    <input id="u" type="text" placeholder="URL または検索ワードを入力" autofocus required>
+    <input id="u" type="text" placeholder="コマンドを待機中…" autofocus required>
     <button type="submit">開く</button>
   </form>
   <label class="chk"><input type="checkbox" id="c"> 履歴を残さない (about:blank で表示)</label>
@@ -733,7 +744,7 @@ const INDEX_HTML = `<!doctype html>
   <noscript>JavaScript を有効にしてください。</noscript>
 </main>
 <footer>
-  &copy;2026 <a href="https://github.com/20250199-tomohiro" target="_blank" rel="noopener">tomohiro-20250199</a>&amp;<a href="http://www.claude.ai" target="_blank" rel="noopener">Claude</a><br>
+  &copy;2026 <a href="https://github.com/20250199-tomohiro" target="_blank" rel="noopener">20250199-tomohiro</a>&amp;<a href="http://www.claude.ai" target="_blank" rel="noopener">Claude</a><br>
   このプロキシは<a href="https://github.com/20250199-tomohiro/project-claude-proxy-v2" target="_blank" rel="noopener">Github</a>でオープンソースとして公開されており、誰でもインストール、開発に参加することができます。
 </footer>
 <script>(${indexMain.toString()})();</script>
@@ -1290,6 +1301,10 @@ const server = http.createServer(async (req, res) => {
     if (path === '/') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
       return res.end(INDEX_HTML);
+    }
+    if (path === '/favicon.svg' || path === '/favicon.ico') {
+      res.writeHead(200, { 'content-type': 'image/svg+xml', 'cache-control': 'public, max-age=86400' });
+      return res.end(FAVICON_SVG);
     }
     if (path === '/sw.js') {
       res.writeHead(200, {
