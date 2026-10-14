@@ -50,7 +50,7 @@ const UPSTREAM_TIMEOUT = 30000; // 応答ヘッダが来るまでの待ち時間
 let YTDLP_BIN = process.env.YTDLP_PATH || path_.join(__dirname, 'bin', 'yt-dlp');
 const YTDLP_URL = process.env.YTDLP_URL || 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
 const YTDLP_MAX = parseInt(process.env.YTDLP_MAX, 10) || 2;
-const YTDLP_TIMEOUT = 60000;
+const YTDLP_TIMEOUT = 40000; // 1 回の試行あたり (最大 3 回試す)
 const YT_CACHE_TTL = 30 * 60 * 1000;
 const YTDLP_HOSTS = (process.env.YTDLP_HOSTS ||
   'youtube.com,youtu.be,youtube-nocookie.com,nicovideo.jp,nico.ms,vimeo.com,twitter.com,x.com,tiktok.com,dailymotion.com,twitch.tv,bilibili.com,instagram.com,facebook.com,reddit.com,soundcloud.com')
@@ -1557,7 +1557,13 @@ function downloadTo(url, dest, redirects) {
 }
 
 function ensureYtdlp() {
-  if (fs.existsSync(YTDLP_BIN)) return Promise.resolve();
+  // 既にあっても 24 時間以上古ければ、裏で最新版を取り直す (YouTube 側の変更に追従するため)
+  const have = fs.existsSync(YTDLP_BIN);
+  let stale = false;
+  try {
+    stale = have && Date.now() - fs.statSync(YTDLP_BIN).mtimeMs > 24 * 3600 * 1000;
+  } catch (e) {}
+  if (have && !stale) return Promise.resolve();
   if (!ytdlpPromise) {
     ytdlpPromise = (async () => {
       let lastErr = new Error('unknown');
@@ -1583,8 +1589,17 @@ function ensureYtdlp() {
     })().finally(() => {
       ytdlpPromise = null;
     });
+    if (have) {
+      // 更新に失敗しても古い版で動かし続ける。失敗時は時刻を更新して毎回の再試行を避ける
+      ytdlpPromise.catch(() => {
+        try {
+          const now = new Date();
+          fs.utimesSync(YTDLP_BIN, now, now);
+        } catch (e) {}
+      });
+    }
   }
-  return ytdlpPromise;
+  return have ? Promise.resolve() : ytdlpPromise;
 }
 
 function ytResolve(url, cb) {
@@ -1593,10 +1608,9 @@ function ytResolve(url, cb) {
   if (ytActive >= YTDLP_MAX) return cb(new Error('サーバーが混み合っています。少し待ってからもう一度お試しください。'));
   const args = ['--ignore-config', '-J', '--no-playlist', '--no-warnings', '--socket-timeout', '15', '--js-runtimes', 'node'];
   if (YT_COOKIE_FILE) args.push('--cookies', YT_COOKIE_FILE);
-  args.push('--', url);
   ytActive++;
   ensureYtdlp().then(
-    () => runYtdlp(args, url, cb),
+    () => runYtdlp(args, url, 0, cb),
     (e) => {
       ytActive--;
       cb(new Error('yt-dlp を用意できませんでした: ' + e.message));
@@ -1604,26 +1618,52 @@ function ytResolve(url, cb) {
   );
 }
 
-function runYtdlp(args, url, cb) {
-  execFile(YTDLP_BIN, args, { timeout: YTDLP_TIMEOUT, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+// YouTube は取得に失敗しやすいので、プレイヤークライアントを替えて順に試す
+const YT_ATTEMPTS = [
+  [],
+  ['--extractor-args', 'youtube:player_client=tv,mweb,web_safari'],
+  ['--extractor-args', 'youtube:player_client=android_vr,ios,web_embedded']
+];
+
+function runYtdlp(base, url, i, cb) {
+  let isYoutube = false;
+  try {
+    isYoutube = /(^|\.)(youtube\.com|youtu\.be|youtube-nocookie\.com)$/i.test(new URL(url).hostname);
+  } catch (e) {}
+  const args = base.concat(YT_ATTEMPTS[i], ['--', url]);
+  // 失敗したら次のクライアントで再試行 (最後の試行なら終了)
+  const retryOrFail = (msg) => {
+    console.error('yt-dlp attempt ' + (i + 1) + ' failed:', msg);
+    if (isYoutube && i + 1 < YT_ATTEMPTS.length) return runYtdlp(base, url, i + 1, cb);
     ytActive--;
+    let hint = '';
+    if (isYoutube && /player response|Sign in|bot|confirm you|HTTP Error 403|429/i.test(msg)) {
+      hint = '\n(サーバーの IP が YouTube にブロックされている可能性があります。YTDLP_COOKIES に cookies.txt を設定すると改善することがあります)';
+    }
+    cb(new Error(msg + hint));
+  };
+  execFile(YTDLP_BIN, args, { timeout: YTDLP_TIMEOUT, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
     if (err) {
       if (err.code === 'ENOENT' || err.code === 'EACCES') {
+        ytActive--;
         try {
           fs.unlinkSync(YTDLP_BIN);
         } catch (e) {}
         return cb(new Error('yt-dlp を実行できませんでした (' + err.code + ')。もう一度お試しください。'));
       }
       const last = String(stderr || err.message).trim().split('\n').filter((l) => /ERROR/.test(l)).pop() || err.message;
-      return cb(new Error(last.replace(/^ERROR:\s*/, '').slice(0, 400)));
+      return retryOrFail(last.replace(/^ERROR:\s*/, '').slice(0, 400));
     }
     let entry;
     try {
       entry = summarizeInfo(JSON.parse(stdout));
     } catch (e) {
-      return cb(new Error('yt-dlp の出力を解釈できませんでした'));
+      return retryOrFail('yt-dlp の出力を解釈できませんでした');
     }
-    if (!entry.list.length) return cb(new Error('再生可能な形式が見つかりませんでした (映像+音声が一体の mp4/webm がありません)'));
+    if (!entry.list.length) {
+      return retryOrFail('再生可能な形式が見つかりませんでした (映像+音声が一体の mp4/webm がありません)');
+    }
+    ytActive--;
     entry.t = Date.now();
     if (ytCache.size > 200) ytCache.delete(ytCache.keys().next().value);
     ytCache.set(url, entry);
