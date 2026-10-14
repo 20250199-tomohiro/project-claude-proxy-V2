@@ -3,6 +3,6 @@ services:
     name: sw-web-proxy
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: npm install && mkdir -p bin && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o bin/yt-dlp && chmod +x bin/yt-dlp
     startCommand: node server.js
     healthCheckPath: /healthz
