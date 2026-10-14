@@ -35,6 +35,7 @@ const net = require('net');
 const crypto = require('crypto');
 const fs = require('fs');
 const path_ = require('path');
+const os = require('os');
 const { execFile } = require('child_process');
 const { WebSocketServer, WebSocket } = require('ws');
 
@@ -46,7 +47,8 @@ const SID_NAME = '__pxsid';
 const MAX_REWRITE = 30 * 1024 * 1024; // HTML/CSS を書き換える際の上限
 const UPSTREAM_TIMEOUT = 30000; // 応答ヘッダが来るまでの待ち時間
 
-const YTDLP_PATH = process.env.YTDLP_PATH || path_.join(__dirname, 'bin', 'yt-dlp');
+let YTDLP_BIN = process.env.YTDLP_PATH || path_.join(__dirname, 'bin', 'yt-dlp');
+const YTDLP_URL = process.env.YTDLP_URL || 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
 const YTDLP_MAX = parseInt(process.env.YTDLP_MAX, 10) || 2;
 const YTDLP_TIMEOUT = 60000;
 const YT_CACHE_TTL = 30 * 60 * 1000;
@@ -1528,6 +1530,63 @@ function summarizeInfo(info) {
   return { title: String((info && info.title) || 'video'), duration: info && info.duration, formats, list };
 }
 
+/* ---- yt-dlp 本体の自動取得 (ビルドコマンドに依存しない) ---- */
+let ytdlpPromise = null;
+
+function downloadTo(url, dest, redirects) {
+  return new Promise((resolve, reject) => {
+    https
+      .get(url, { headers: { 'user-agent': 'sw-web-proxy' } }, (r) => {
+        if ([301, 302, 303, 307, 308].includes(r.statusCode) && r.headers.location) {
+          r.resume();
+          if (redirects >= 6) return reject(new Error('too many redirects'));
+          return downloadTo(new URL(r.headers.location, url).href, dest, redirects + 1).then(resolve, reject);
+        }
+        if (r.statusCode !== 200) {
+          r.resume();
+          return reject(new Error('HTTP ' + r.statusCode));
+        }
+        const f = fs.createWriteStream(dest);
+        r.pipe(f);
+        f.on('finish', () => f.close(() => resolve()));
+        f.on('error', reject);
+        r.on('error', reject);
+      })
+      .on('error', reject);
+  });
+}
+
+function ensureYtdlp() {
+  if (fs.existsSync(YTDLP_BIN)) return Promise.resolve();
+  if (!ytdlpPromise) {
+    ytdlpPromise = (async () => {
+      let lastErr = new Error('unknown');
+      for (const dest of [YTDLP_BIN, path_.join(os.tmpdir(), 'yt-dlp')]) {
+        const part = dest + '.part';
+        try {
+          fs.mkdirSync(path_.dirname(dest), { recursive: true });
+          console.log('downloading yt-dlp ->', dest);
+          await downloadTo(YTDLP_URL, part, 0);
+          fs.chmodSync(part, 0o755);
+          fs.renameSync(part, dest);
+          YTDLP_BIN = dest;
+          console.log('yt-dlp ready');
+          return;
+        } catch (e) {
+          lastErr = e;
+          try {
+            fs.unlinkSync(part);
+          } catch (e2) {}
+        }
+      }
+      throw lastErr;
+    })().finally(() => {
+      ytdlpPromise = null;
+    });
+  }
+  return ytdlpPromise;
+}
+
 function ytResolve(url, cb) {
   const c = ytCache.get(url);
   if (c && Date.now() - c.t < YT_CACHE_TTL) return cb(null, c);
@@ -1536,10 +1595,25 @@ function ytResolve(url, cb) {
   if (YT_COOKIE_FILE) args.push('--cookies', YT_COOKIE_FILE);
   args.push('--', url);
   ytActive++;
-  execFile(YTDLP_PATH, args, { timeout: YTDLP_TIMEOUT, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+  ensureYtdlp().then(
+    () => runYtdlp(args, url, cb),
+    (e) => {
+      ytActive--;
+      cb(new Error('yt-dlp を用意できませんでした: ' + e.message));
+    }
+  );
+}
+
+function runYtdlp(args, url, cb) {
+  execFile(YTDLP_BIN, args, { timeout: YTDLP_TIMEOUT, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
     ytActive--;
     if (err) {
-      if (err.code === 'ENOENT') return cb(new Error('yt-dlp が見つかりません (ビルド時にダウンロードされていません)'));
+      if (err.code === 'ENOENT' || err.code === 'EACCES') {
+        try {
+          fs.unlinkSync(YTDLP_BIN);
+        } catch (e) {}
+        return cb(new Error('yt-dlp を実行できませんでした (' + err.code + ')。もう一度お試しください。'));
+      }
       const last = String(stderr || err.message).trim().split('\n').filter((l) => /ERROR/.test(l)).pop() || err.message;
       return cb(new Error(last.replace(/^ERROR:\s*/, '').slice(0, 400)));
     }
@@ -1834,6 +1908,7 @@ server.on('upgrade', (req, socket, head) => {
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`web proxy listening on :${PORT}` + (BASIC_AUTH ? ' (basic auth on)' : ''));
+  ensureYtdlp().catch((e) => console.error('yt-dlp download failed:', e.message)); // 起動時に先読み
 });
 
 process.on('unhandledRejection', (e) => console.error('unhandledRejection', e));
