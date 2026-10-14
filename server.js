@@ -12,6 +12,7 @@
  *  ALLOW_PRIVATE "1" でプライベート IP / localhost への接続を許可 (テスト専用)
  *  YTDLP_PATH    yt-dlp 実行ファイルのパス (既定: ./bin/yt-dlp)
  *  YTDLP_HOSTS   動画モードで許可するドメインをカンマ区切りで指定 ("*" で全て許可)
+ *  YTDLP_URL     yt-dlp の取得先 (既定: nightly 版。安定版にしたい場合は yt-dlp/yt-dlp の latest を指定)
  *  YTDLP_COOKIES yt-dlp 用 cookies.txt のパス (任意。Render の Secret Files 等。YouTube の bot 判定対策)
  *  YTDLP_MAX     yt-dlp の同時実行数 (既定 2)
  *
@@ -48,7 +49,7 @@ const MAX_REWRITE = 30 * 1024 * 1024; // HTML/CSS を書き換える際の上限
 const UPSTREAM_TIMEOUT = 30000; // 応答ヘッダが来るまでの待ち時間
 
 let YTDLP_BIN = process.env.YTDLP_PATH || path_.join(__dirname, 'bin', 'yt-dlp');
-const YTDLP_URL = process.env.YTDLP_URL || 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
+const YTDLP_URL = process.env.YTDLP_URL || 'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp_linux';
 const YTDLP_MAX = parseInt(process.env.YTDLP_MAX, 10) || 2;
 const YTDLP_TIMEOUT = 40000; // 1 回の試行あたり (最大 3 回試す)
 const YT_CACHE_TTL = 30 * 60 * 1000;
