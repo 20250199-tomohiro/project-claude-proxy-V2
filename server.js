@@ -716,6 +716,9 @@ const INDEX_HTML = `<!doctype html>
   button:hover{background:#4a7bf0}
   .chk{display:inline-flex;align-items:center;gap:8px;margin-top:16px;font-size:14px;color:#aab0c0;cursor:pointer;user-select:none}
   .st{min-height:1.4em;margin:14px 0 0;font-size:13px;color:#ffb86b}
+  footer{position:fixed;left:0;right:0;bottom:0;padding:14px 16px;text-align:center;font-size:12px;line-height:1.7;color:#8a90a2}
+  footer a{color:#8fb0ff;text-decoration:none}
+  footer a:hover{text-decoration:underline}
 </style>
 </head>
 <body>
@@ -729,6 +732,10 @@ const INDEX_HTML = `<!doctype html>
   <p id="s" class="st"></p>
   <noscript>JavaScript を有効にしてください。</noscript>
 </main>
+<footer>
+  &copy;2026 <a href="https://github.com/20250199-tomohiro" target="_blank" rel="noopener">tomohiro-20250199</a>&amp;<a href="http://www.claude.ai" target="_blank" rel="noopener">Claude</a><br>
+  このプロキシは<a href="https://github.com/20250199-tomohiro/project-claude-proxy-v2" target="_blank" rel="noopener">Github</a>でオープンソースとして公開されており、誰でもインストール、開発に参加することができます。
+</footer>
 <script>(${indexMain.toString()})();</script>
 </body>
 </html>`;
