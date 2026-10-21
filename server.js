@@ -208,12 +208,55 @@ function clientMain() {
       return nb.call(navigator, toProxy(url), data);
     };
   }
+  // ナビバー付きページ (タブ) の中かどうか
+  function hasShell() {
+    try {
+      var w = window;
+      while (w !== w.parent) {
+        w = w.parent;
+        if (w.__PX_SHELL) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  function postOpen(path) {
+    try {
+      var w = window;
+      while (w !== w.parent) {
+        w = w.parent;
+        w.postMessage({ pxopen: path }, '*');
+      }
+    } catch (e) {}
+  }
   var nopen = window.open;
   window.open = function (url) {
     var a = Array.prototype.slice.call(arguments);
     if (url) a[0] = toProxy(url);
+    // プロキシ内のタブとして開く
+    if (typeof a[0] === 'string' && a[0].indexOf('/go/') === 0 && hasShell()) {
+      postOpen(a[0]);
+      return null;
+    }
     return nopen.apply(window, a);
   };
+  // target="_blank" のリンクも新しいタブで開く
+  document.addEventListener(
+    'click',
+    function (ev) {
+      try {
+        var an = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+        if (!an || ev.defaultPrevented) return;
+        var tg = (an.getAttribute('target') || '').toLowerCase();
+        if ((tg !== '_blank' && tg !== '_new') || !hasShell()) return;
+        var pp = toProxy(an.getAttribute('href'));
+        if (typeof pp === 'string' && pp.indexOf('/go/') === 0) {
+          ev.preventDefault();
+          postOpen(pp);
+        }
+      } catch (e) {}
+    },
+    false
+  );
   ['pushState', 'replaceState'].forEach(function (k) {
     var o = history[k];
     history[k] = function (s, t, u) {
@@ -771,9 +814,16 @@ const CLIENT_JS = '(' + clientMain.toString() + ')();';
 
 /* ---------- ナビゲーションバー付きの表示ページ (/~/shell) ---------- */
 function shellMain() {
-  var fr = document.getElementById('fr');
+  window.__PX_SHELL = true;
   var a = document.getElementById('a');
+  var tabsEl = document.getElementById('tabs');
+  var holder = document.getElementById('holder');
+  var plus = document.getElementById('np');
   var RX = /^\/go\/(https?)\/([^\/?#]+)(\/[^?#]*)?/;
+  var MAX_TABS = 30;
+  var tabs = [];
+  var cur = null;
+  var seq = 0;
 
   function normalize(v) {
     v = v.trim();
@@ -814,20 +864,144 @@ function shellMain() {
       });
   }
 
-  // iframe 内の現在のページを、元のURLとして入力欄に表示
-  function show() {
+  /* ---------- タブ ---------- */
+  function tabTitle(t) {
     try {
-      if (document.activeElement === a) return;
-      var l = fr.contentWindow.location;
+      var d = t.fr.contentDocument;
+      if (d && d.title) return d.title;
+      var m = RX.exec(t.fr.contentWindow.location.pathname);
+      if (m) return m[2];
+    } catch (e) {}
+    return '新しいタブ';
+  }
+  function newTab(src, activate) {
+    if (tabs.length >= MAX_TABS) return null;
+    var t = { id: ++seq, last: null, title: '' };
+    t.fr = document.createElement('iframe');
+    t.fr.className = 'fr';
+    t.fr.setAttribute('allow', 'fullscreen; autoplay; clipboard-read; clipboard-write');
+    t.fr.setAttribute('allowfullscreen', '');
+    t.fr.style.display = 'none';
+    t.fr.src = src || '/';
+    holder.appendChild(t.fr);
+
+    t.el = document.createElement('div');
+    t.el.className = 'tab';
+    t.tt = document.createElement('span');
+    t.tt.className = 't';
+    t.tt.textContent = '新しいタブ';
+    t.x = document.createElement('button');
+    t.x.className = 'x';
+    t.x.textContent = '×';
+    t.x.title = '閉じる';
+    t.el.appendChild(t.tt);
+    t.el.appendChild(t.x);
+    t.el.addEventListener('click', function () {
+      setActive(t);
+    });
+    t.x.addEventListener('click', function (ev) {
+      ev.stopPropagation();
+      closeTab(t);
+    });
+    // 中ボタンで閉じる
+    t.el.addEventListener('auxclick', function (ev) {
+      if (ev.button === 1) closeTab(t);
+    });
+    tabsEl.insertBefore(t.el, plus);
+    tabs.push(t);
+    if (activate || !cur) setActive(t);
+    return t;
+  }
+  function setActive(t) {
+    cur = t;
+    for (var i = 0; i < tabs.length; i++) {
+      var on = tabs[i] === t;
+      tabs[i].fr.style.display = on ? 'block' : 'none';
+      tabs[i].el.className = 'tab' + (on ? ' on' : '');
+    }
+    a.value = '';
+    show(true);
+    try {
+      t.el.scrollIntoView({ inline: 'nearest', block: 'nearest' });
+    } catch (e) {}
+  }
+  function closeTab(t) {
+    var i = tabs.indexOf(t);
+    if (i < 0) return;
+    tabs.splice(i, 1);
+    try {
+      t.fr.src = 'about:blank';
+    } catch (e) {}
+    t.fr.remove();
+    t.el.remove();
+    if (!tabs.length) {
+      cur = null;
+      newTab('/', true);
+    } else if (cur === t) {
+      setActive(tabs[Math.min(i, tabs.length - 1)]);
+    }
+  }
+  plus.addEventListener('click', function () {
+    var t = newTab('/', true);
+    if (t) a.focus();
+  });
+
+  // 現在のタブのURLを入力欄に表示 / 全タブのタイトルを更新
+  function show(force) {
+    for (var i = 0; i < tabs.length; i++) {
+      var t = tabs[i];
+      var ti = tabTitle(t);
+      if (ti !== t.title) {
+        t.title = ti;
+        t.tt.textContent = ti;
+        t.el.title = ti;
+      }
+    }
+    if (!cur) return;
+    try {
+      if (!force && document.activeElement === a) return;
+      var l = cur.fr.contentWindow.location;
       var m = RX.exec(l.pathname);
-      var t = m ? m[1] + '://' + m[2] + (m[3] || '/') + l.search + l.hash : '';
-      if (a.value !== t) a.value = t;
+      var u = m ? m[1] + '://' + m[2] + (m[3] || '/') + l.search + l.hash : '';
+      if (a.value !== u) a.value = u;
     } catch (e) {}
   }
   setInterval(show, 500);
-  fr.addEventListener('load', show);
 
-  /* --- デバッグ: iframe 内のログ受信 + 移動先URLの記録 --- */
+  function hist(fn) {
+    try {
+      fn(cur.fr.contentWindow);
+    } catch (e) {}
+  }
+  document.getElementById('b').addEventListener('click', function () {
+    hist(function (w) {
+      w.history.back();
+    });
+  });
+  document.getElementById('n').addEventListener('click', function () {
+    hist(function (w) {
+      w.history.forward();
+    });
+  });
+  document.getElementById('r').addEventListener('click', function () {
+    hist(function (w) {
+      w.location.reload();
+    });
+  });
+  document.getElementById('h').addEventListener('click', function () {
+    if (cur) cur.fr.src = '/';
+  });
+  a.addEventListener('keydown', function (ev) {
+    if (ev.key !== 'Enter' || !cur) return;
+    var url = normalize(a.value);
+    if (!url) return;
+    try {
+      cur.fr.src = toPath(url);
+      a.blur();
+    } catch (e) {}
+  });
+
+  /* ---------- デバッグ: iframe 内のログ受信 + 移動先URLの記録 ---------- */
   var logs = [];
   var dBtn = document.getElementById('d');
   var dPanel = document.getElementById('p');
@@ -852,23 +1026,28 @@ function shellMain() {
     if (logs.length >= 300) logs.shift();
     logs.push(t);
     dBtn.style.display = 'block';
-    dBtn.textContent = '\uD83D\uDC1E ' + logs.length;
+    dBtn.textContent = '🐞 ' + logs.length;
     if (dPanel.style.display === 'flex') fill();
   }
   window.addEventListener('message', function (ev) {
-    if (ev.data && typeof ev.data.pxlog === 'string') addLog(ev.data.pxlog);
+    var d = ev.data;
+    if (!d) return;
+    if (typeof d.pxlog === 'string') addLog(d.pxlog);
+    else if (typeof d.pxopen === 'string' && /^\/go\/https?\/[^\/]/.test(d.pxopen)) newTab(d.pxopen, true);
   });
-  var lastHref = null;
   setInterval(function () {
-    var h;
-    try {
-      h = fr.contentWindow.location.href;
-    } catch (e) {
-      h = '(アクセス不可)';
-    }
-    if (h !== lastHref) {
-      addLog('[' + new Date().toTimeString().slice(0, 8) + '] NAV ' + h);
-      lastHref = h;
+    for (var i = 0; i < tabs.length; i++) {
+      var t = tabs[i];
+      var h;
+      try {
+        h = t.fr.contentWindow.location.href;
+      } catch (e) {
+        h = '(アクセス不可)';
+      }
+      if (h !== t.last) {
+        addLog('[' + new Date().toTimeString().slice(0, 8) + '] NAV (タブ' + t.id + ') ' + h);
+        t.last = h;
+      }
     }
   }, 150);
   dBtn.addEventListener('click', function () {
@@ -898,39 +1077,6 @@ function shellMain() {
     dPanel.style.display = 'none';
   });
 
-  function hist(fn) {
-    try {
-      fn(fr.contentWindow);
-    } catch (e) {}
-  }
-  document.getElementById('b').addEventListener('click', function () {
-    hist(function (w) {
-      w.history.back();
-    });
-  });
-  document.getElementById('n').addEventListener('click', function () {
-    hist(function (w) {
-      w.history.forward();
-    });
-  });
-  document.getElementById('r').addEventListener('click', function () {
-    hist(function (w) {
-      w.location.reload();
-    });
-  });
-  document.getElementById('h').addEventListener('click', function () {
-    fr.src = '/';
-  });
-  a.addEventListener('keydown', function (ev) {
-    if (ev.key !== 'Enter') return;
-    var url = normalize(a.value);
-    if (!url) return;
-    try {
-      fr.src = toPath(url);
-      a.blur();
-    } catch (e) {}
-  });
-
   var q = new URLSearchParams(location.search).get('u');
   var start = q && /^\/go\/https?\/[^\/]/.test(q) ? q : '/';
   // 外側ページのURLは常に「/」に固定 (開いているサイトによって変わらない)
@@ -938,7 +1084,7 @@ function shellMain() {
     history.replaceState(null, '', '/');
   } catch (e) {}
   ensureSW().then(function () {
-    fr.src = start;
+    newTab(start, true);
   });
 }
 
@@ -952,7 +1098,18 @@ const SHELL_HTML = `<!doctype html>
 <style>
   *{box-sizing:border-box}
   html,body{margin:0;height:100%;background:#0f1117}
-  #bar{position:fixed;top:0;left:0;right:0;height:44px;display:flex;gap:6px;align-items:center;padding:6px 8px;
+  #tabs{position:fixed;top:0;left:0;right:0;height:34px;display:flex;gap:4px;align-items:flex-end;padding:4px 8px 0;
+        background:#0f1117;overflow-x:auto;overflow-y:hidden;font-family:system-ui,sans-serif}
+  .tab{display:flex;align-items:center;gap:6px;width:180px;flex:none;height:30px;padding:0 6px 0 12px;border-radius:8px 8px 0 0;
+       background:#1d2130;color:#aab0c0;font-size:12px;cursor:pointer;user-select:none}
+  .tab:hover{background:#242938}
+  .tab.on{background:#171a23;color:#fff}
+  .tab .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .tab .x{width:20px;height:20px;border:0;border-radius:10px;background:transparent;color:inherit;cursor:pointer;font-size:14px;line-height:1;padding:0;flex:none}
+  .tab .x:hover{background:#3a4160}
+  #np{width:28px;height:28px;margin-bottom:2px;border:0;border-radius:8px;background:transparent;color:#aab0c0;font-size:18px;cursor:pointer;flex:none}
+  #np:hover{background:#242938;color:#fff}
+  #bar{position:fixed;top:34px;left:0;right:0;height:44px;display:flex;gap:6px;align-items:center;padding:6px 8px;
        background:#171a23;border-bottom:1px solid #2b3040;font-family:system-ui,sans-serif}
   #bar button{width:34px;height:32px;border:0;border-radius:8px;background:#242938;color:#e8eaf0;font-size:16px;cursor:pointer;flex:none}
   #bar button:hover{background:#2f3550}
@@ -960,16 +1117,17 @@ const SHELL_HTML = `<!doctype html>
      color:#e8eaf0;font-size:14px;outline:none}
   #a:focus{border-color:#5b8cff}
   #d{display:none;width:auto!important;padding:0 10px;background:#c62828!important;font-size:13px!important}
-  #p{position:fixed;z-index:10;top:50px;right:8px;width:min(620px,94vw);height:min(420px,70vh);display:none;flex-direction:column;
+  #p{position:fixed;z-index:10;top:84px;right:8px;width:min(620px,94vw);height:min(420px,70vh);display:none;flex-direction:column;
      background:#111;color:#eee;border:1px solid #555;border-radius:8px;overflow:hidden;font:12px/1.5 monospace}
   #p .hd{display:flex;gap:6px;padding:6px;background:#222;align-items:center}
   #p .hd span{flex:1;color:#ffb86b}
   #p .hd button{width:auto;height:auto;padding:3px 8px;font:12px monospace}
   #l{flex:1;overflow:auto;padding:8px;white-space:pre-wrap;word-break:break-all}
-  #fr{position:fixed;top:44px;left:0;right:0;bottom:0;width:100%;height:calc(100% - 44px);border:0;background:#fff}
+  .fr{position:fixed;top:78px;left:0;right:0;bottom:0;width:100%;height:calc(100% - 78px);border:0;background:#fff}
 </style>
 </head>
 <body>
+<div id="tabs"><button id="np" title="新しいタブ">+</button></div>
 <div id="bar">
   <button id="b" title="戻る">&#8592;</button>
   <button id="n" title="進む">&#8594;</button>
@@ -979,7 +1137,7 @@ const SHELL_HTML = `<!doctype html>
   <button id="d" title="デバッグログ">&#128030;</button>
 </div>
 <div id="p"><div class="hd"><span>Debug ログ (NAV = 移動先URLの記録)</span><button id="pc">コピー</button><button id="px">クリア</button></div><div id="l"></div></div>
-<iframe id="fr" allow="fullscreen; autoplay; clipboard-read; clipboard-write" allowfullscreen></iframe>
+<div id="holder"></div>
 <script>(${shellMain.toString()})();</script>
 </body>
 </html>`;
