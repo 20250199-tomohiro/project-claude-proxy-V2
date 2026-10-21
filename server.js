@@ -523,7 +523,16 @@ function clientMain() {
       try {
         if (/ResizeObserver loop/.test(msg)) return;
         if (logs.length >= 200) logs.shift();
-        logs.push('[' + new Date().toTimeString().slice(0, 8) + '] ' + kind + ' ' + short(msg, 600));
+        var line = '[' + new Date().toTimeString().slice(0, 8) + '] ' + kind + ' ' + short(msg, 600);
+        logs.push(line);
+        // ナビバー付きページ (外側) にも送る: ゲームがページを書き換えても消えない
+        try {
+          var w = window;
+          while (w !== w.parent) {
+            w = w.parent;
+            w.postMessage({ pxlog: location.pathname.slice(0, 80) + ' ' + line }, '*');
+          }
+        } catch (e) {}
         if (!badge) build();
         render();
       } catch (e) {}
@@ -558,6 +567,27 @@ function clientMain() {
       } catch (e) {}
       return ce.apply(console, arguments);
     };
+
+    // ページ全体の書き換え (document.open / write) と離脱の記録
+    try {
+      var dopen = Document.prototype.open;
+      Document.prototype.open = function () {
+        if (arguments.length < 3) add('document.open', 'ページ全体が書き換えられます (document.write)');
+        return dopen.apply(this, arguments);
+      };
+    } catch (e) {}
+    window.addEventListener('beforeunload', function () {
+      add('ページ離脱', '別のページへ移動 / 再読み込みが始まりました');
+    });
+    // ゲームが DOM を作り直してもバッジが消えないよう、定期的に付け直す
+    setInterval(function () {
+      try {
+        if (badge && document.documentElement && !badge.isConnected) {
+          document.documentElement.appendChild(panel);
+          document.documentElement.appendChild(badge);
+        }
+      } catch (e) {}
+    }, 500);
 
     // fetch の失敗 (ネットワークエラー / HTTP 4xx,5xx)
     var f2 = window.fetch;
@@ -782,6 +812,67 @@ function shellMain() {
   setInterval(show, 500);
   fr.addEventListener('load', show);
 
+  /* --- デバッグ: iframe 内のログ受信 + 移動先URLの記録 --- */
+  var logs = [];
+  var dBtn = document.getElementById('d');
+  var dPanel = document.getElementById('p');
+  var dList = document.getElementById('l');
+  function addLog(t) {
+    if (logs.length >= 300) logs.shift();
+    logs.push(t);
+    dBtn.style.display = 'block';
+    dBtn.textContent = '\uD83D\uDC1E ' + logs.length;
+    if (dPanel.style.display === 'flex') {
+      dList.textContent = logs.join('\n\n');
+      dList.scrollTop = dList.scrollHeight;
+    }
+  }
+  window.addEventListener('message', function (ev) {
+    if (ev.data && typeof ev.data.pxlog === 'string') addLog(ev.data.pxlog);
+  });
+  var lastHref = null;
+  setInterval(function () {
+    var h;
+    try {
+      h = fr.contentWindow.location.href;
+    } catch (e) {
+      h = '(アクセス不可)';
+    }
+    if (h !== lastHref) {
+      addLog('[' + new Date().toTimeString().slice(0, 8) + '] NAV ' + h);
+      lastHref = h;
+    }
+  }, 150);
+  dBtn.addEventListener('click', function () {
+    var open = dPanel.style.display === 'flex';
+    dPanel.style.display = open ? 'none' : 'flex';
+    if (!open) {
+      dList.textContent = logs.join('\n\n');
+      dList.scrollTop = dList.scrollHeight;
+    }
+  });
+  document.getElementById('pc').addEventListener('click', function () {
+    var t = logs.join('\n\n');
+    try {
+      navigator.clipboard.writeText(t);
+    } catch (e) {
+      var ta = document.createElement('textarea');
+      ta.value = t;
+      document.body.appendChild(ta);
+      ta.select();
+      try {
+        document.execCommand('copy');
+      } catch (e2) {}
+      ta.remove();
+    }
+  });
+  document.getElementById('px').addEventListener('click', function () {
+    logs = [];
+    dList.textContent = '';
+    dBtn.style.display = 'none';
+    dPanel.style.display = 'none';
+  });
+
   function hist(fn) {
     try {
       fn(fr.contentWindow);
@@ -843,6 +934,13 @@ const SHELL_HTML = `<!doctype html>
   #a{flex:1;min-width:0;height:32px;padding:0 14px;border-radius:16px;border:1px solid #2b3040;background:#0f1117;
      color:#e8eaf0;font-size:14px;outline:none}
   #a:focus{border-color:#5b8cff}
+  #d{display:none;width:auto!important;padding:0 10px;background:#c62828!important;font-size:13px!important}
+  #p{position:fixed;z-index:10;top:50px;right:8px;width:min(620px,94vw);height:min(420px,70vh);display:none;flex-direction:column;
+     background:#111;color:#eee;border:1px solid #555;border-radius:8px;overflow:hidden;font:12px/1.5 monospace}
+  #p .hd{display:flex;gap:6px;padding:6px;background:#222;align-items:center}
+  #p .hd span{flex:1;color:#ffb86b}
+  #p .hd button{width:auto;height:auto;padding:3px 8px;font:12px monospace}
+  #l{flex:1;overflow:auto;padding:8px;white-space:pre-wrap;word-break:break-all}
   #fr{position:fixed;top:44px;left:0;right:0;bottom:0;width:100%;height:calc(100% - 44px);border:0;background:#fff}
 </style>
 </head>
@@ -853,7 +951,9 @@ const SHELL_HTML = `<!doctype html>
   <button id="r" title="再読み込み">&#10227;</button>
   <button id="h" title="ホーム">&#8962;</button>
   <input id="a" type="text" placeholder="URL または検索ワードを入力" autocomplete="off" spellcheck="false">
+  <button id="d" title="デバッグログ">&#128030;</button>
 </div>
+<div id="p"><div class="hd"><span>Debug ログ (NAV = 移動先URLの記録)</span><button id="pc">コピー</button><button id="px">クリア</button></div><div id="l"></div></div>
 <iframe id="fr" allow="fullscreen; autoplay; clipboard-read; clipboard-write" allowfullscreen></iframe>
 <script>(${shellMain.toString()})();</script>
 </body>
