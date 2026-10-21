@@ -460,11 +460,26 @@ function clientMain() {
       s = String(s);
       return s.length > n ? s.slice(0, n) + '…' : s;
     }
+    function logColor(t) {
+      if (/\] NAV /.test(t)) return '#6cb6ff';
+      if (/\] document\.open/.test(t)) return '#ffa726';
+      if (/\] (JSエラー|LOAD失敗|HTTP \d|通信失敗|Promise拒否|console\.error|WebSocket失敗)/.test(t)) return '#ff6b6b';
+      return '#eee';
+    }
+    function fillList(box) {
+      box.textContent = '';
+      for (var i = 0; i < logs.length; i++) {
+        var d = document.createElement('div');
+        d.style.cssText = 'margin-bottom:8px;color:' + logColor(logs[i]);
+        d.textContent = logs[i];
+        box.appendChild(d);
+      }
+    }
     function render() {
       if (!badge) return;
       badge.textContent = '⚠ ' + logs.length;
       badge.style.display = logs.length ? 'block' : 'none';
-      if (open && list) list.textContent = logs.join('\n\n');
+      if (open && list) fillList(list);
       if (open && list) list.scrollTop = list.scrollHeight;
     }
     function build() {
@@ -817,15 +832,28 @@ function shellMain() {
   var dBtn = document.getElementById('d');
   var dPanel = document.getElementById('p');
   var dList = document.getElementById('l');
+  function logColor(t) {
+    if (/\] NAV /.test(t)) return '#6cb6ff';
+    if (/\] document\.open/.test(t)) return '#ffa726';
+    if (/\] (JSエラー|LOAD失敗|HTTP \d|通信失敗|Promise拒否|console\.error|WebSocket失敗)/.test(t)) return '#ff6b6b';
+    return '#eee';
+  }
+  function fill() {
+    dList.textContent = '';
+    for (var i = 0; i < logs.length; i++) {
+      var d = document.createElement('div');
+      d.style.cssText = 'margin-bottom:8px;color:' + logColor(logs[i]);
+      d.textContent = logs[i];
+      dList.appendChild(d);
+    }
+    dList.scrollTop = dList.scrollHeight;
+  }
   function addLog(t) {
     if (logs.length >= 300) logs.shift();
     logs.push(t);
     dBtn.style.display = 'block';
     dBtn.textContent = '\uD83D\uDC1E ' + logs.length;
-    if (dPanel.style.display === 'flex') {
-      dList.textContent = logs.join('\n\n');
-      dList.scrollTop = dList.scrollHeight;
-    }
+    if (dPanel.style.display === 'flex') fill();
   }
   window.addEventListener('message', function (ev) {
     if (ev.data && typeof ev.data.pxlog === 'string') addLog(ev.data.pxlog);
@@ -846,10 +874,7 @@ function shellMain() {
   dBtn.addEventListener('click', function () {
     var open = dPanel.style.display === 'flex';
     dPanel.style.display = open ? 'none' : 'flex';
-    if (!open) {
-      dList.textContent = logs.join('\n\n');
-      dList.scrollTop = dList.scrollHeight;
-    }
+    if (!open) fill();
   });
   document.getElementById('pc').addEventListener('click', function () {
     var t = logs.join('\n\n');
