@@ -22,3 +22,7 @@
 3. デプロイを押してしばらく待ち、https://(サーバー名).onrender.comが出たら成功!
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy)
+
+##Cloudflare版もどうぞ
+https://github.com/20250199-tomohiro/project-claude-proxy-v2-cloudflare-port  
+で、Cloudflare版が上がってます。
