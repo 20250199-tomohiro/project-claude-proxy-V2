@@ -894,8 +894,8 @@ const CLOAK_PNG_DARK = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHe
 const CLOAK_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">' +
   '<style>.d{display:none}@media (prefers-color-scheme:dark){.l{display:none}.d{display:inline}}</style>' +
-  '<image class="l" x="11" y="11" width="42" height="42" href="data:image/png;base64,' + CLOAK_PNG.toString('base64') + '"/>' +
-  '<image class="d" x="11" y="11" width="42" height="42" href="data:image/png;base64,' + CLOAK_PNG_DARK.toString('base64') + '"/>' +
+  '<image class="l" x="8" y="8" width="48" height="48" href="data:image/png;base64,' + CLOAK_PNG.toString('base64') + '"/>' +
+  '<image class="d" x="8" y="8" width="48" height="48" href="data:image/png;base64,' + CLOAK_PNG_DARK.toString('base64') + '"/>' +
   '</svg>';
 const CLOAK_JS = '(' + cloakInit.toString() + ')();';
 const SW_JS = '(' + swMain.toString() + ')();';
