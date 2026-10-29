@@ -790,6 +790,7 @@ function indexMain() {
               '<style>html,body{margin:0;height:100%;overflow:hidden;background:#fff}' +
               'iframe{border:0;width:100%;height:100%}</style></head><body>' +
               '<iframe src="' + full + '" allow="fullscreen; autoplay; clipboard-read; clipboard-write" allowfullscreen></iframe>' +
+              '<script src="' + location.origin + '/~/cloak.js"><\/script>' +
               '</body></html>'
           );
           d.close();
@@ -805,10 +806,92 @@ function indexMain() {
   });
 }
 
+/* ---------- 他のタブへ移動したとき: タブ名を「新しいタブ」+ 画像アイコンに差し替え ---------- */
+function cloakInit() {
+  // ナビバー付きページ内の iframe では動かさない (外側ページだけが対象)
+  try {
+    if (window.top !== window) return;
+  } catch (e) {
+    return;
+  }
+  if (window.__PX_CLOAK) return;
+  window.__PX_CLOAK = true;
+  var TITLE = '新しいタブ';
+  // about:blank から読み込まれた場合でも届くよう、スクリプト自身の URL からオリジンを求める
+  var base = '';
+  try {
+    var cs = document.currentScript;
+    base = cs && cs.src ? new URL(cs.src).origin : location.origin;
+  } catch (e) {}
+  var HREF_LIGHT = base + '/~/cloak.png';
+  var HREF_DARK = base + '/~/cloak-dark.png';
+  var mq = null;
+  try {
+    mq = window.matchMedia('(prefers-color-scheme: dark)');
+  } catch (e) {}
+  function iconHref() {
+    return mq && mq.matches ? HREF_DARK : HREF_LIGHT;
+  }
+  try {
+    new Image().src = HREF_LIGHT; // 先読み
+    new Image().src = HREF_DARK;
+  } catch (e) {}
+  var saved = null;
+  var fake = null;
+
+  function hide() {
+    if (saved) return;
+    var head = document.head || document.documentElement;
+    saved = {
+      title: document.title,
+      icons: [].slice.call(document.querySelectorAll('link[rel~="icon"]'))
+    };
+    saved.icons.forEach(function (l) {
+      l.remove();
+    });
+    fake = document.createElement('link');
+    fake.rel = 'icon';
+    fake.type = 'image/png';
+    fake.href = iconHref();
+    head.appendChild(fake);
+    document.title = TITLE;
+  }
+  function show() {
+    if (!saved) return;
+    var head = document.head || document.documentElement;
+    if (fake) fake.remove();
+    saved.icons.forEach(function (l) {
+      head.appendChild(l);
+    });
+    document.title = saved.title;
+    saved = null;
+    fake = null;
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) hide();
+    else show();
+  });
+  // 隠れている間にテーマが切り替わったらアイコンも追従
+  function onTheme() {
+    if (fake) fake.href = iconHref();
+  }
+  try {
+    if (mq) {
+      if (mq.addEventListener) mq.addEventListener('change', onTheme);
+      else if (mq.addListener) mq.addListener(onTheme);
+    }
+  } catch (e) {}
+  if (document.hidden) hide();
+}
+
 /* ========================================================================
  *  埋め込みリソース
  * ====================================================================== */
 
+// 他のタブにいる間に表示するアイコン (ライト: 黒 / ダーク: 白, 64x64)
+const CLOAK_PNG = Buffer.from('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', 'base64');
+const CLOAK_PNG_DARK = Buffer.from('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', 'base64');
+const CLOAK_JS = '(' + cloakInit.toString() + ')();';
 const SW_JS = '(' + swMain.toString() + ')();';
 const CLIENT_JS = '(' + clientMain.toString() + ')();';
 
@@ -1138,6 +1221,7 @@ const SHELL_HTML = `<!doctype html>
 </div>
 <div id="p"><div class="hd"><span>Debug ログ (NAV = 移動先URLの記録)</span><button id="pc">コピー</button><button id="px">クリア</button></div><div id="l"></div></div>
 <div id="holder"></div>
+<script src="/~/cloak.js"></script>
 <script>(${shellMain.toString()})();</script>
 </body>
 </html>`;
@@ -1194,6 +1278,7 @@ const INDEX_HTML = `<!doctype html>
   &copy;2026 <a href="https://github.com/20250199-tomohiro" target="_blank" rel="noopener">20250199-tomohiro</a>&amp;<a href="http://www.claude.ai" target="_blank" rel="noopener">Claude</a><br>
   このプロキシは<a href="https://github.com/20250199-tomohiro/project-claude-proxy-v2" target="_blank" rel="noopener">Github</a>でオープンソースとして公開されており、誰でもインストール、開発に参加することができます。
 </footer>
+<script src="/~/cloak.js"></script>
 <script>(${indexMain.toString()})();</script>
 </body>
 </html>`;
@@ -1760,6 +1845,18 @@ const server = http.createServer(async (req, res) => {
         'cache-control': 'no-cache'
       });
       return res.end(SW_JS);
+    }
+    if (path === '/~/cloak.js') {
+      res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8', 'cache-control': 'no-cache' });
+      return res.end(CLOAK_JS);
+    }
+    if (path === '/~/cloak-dark.png') {
+      res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'public, max-age=86400' });
+      return res.end(CLOAK_PNG_DARK);
+    }
+    if (path === '/~/cloak.png') {
+      res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'public, max-age=86400' });
+      return res.end(CLOAK_PNG);
     }
     if (path === '/~/client.js') {
       res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8', 'cache-control': 'no-cache' });
