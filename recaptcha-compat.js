@@ -93,6 +93,7 @@
     const proxyOrigin = opts.proxyOrigin;
     const proxyHost = new URL(proxyOrigin).hostname;
     const decodeUrl = opts.decodeUrl; // proxyUrl(string) -> realUrl(string)
+    const debug = !!opts.debug;       // true で SW のコンソールに診断ログを出す
 
     function safeDecode(u) {
       try {
@@ -125,6 +126,21 @@
       }
       // 3) 親が reCAPTCHA 自身（anchor→bframe 等）なら埋め込み元は `co` から復元できるので null のまま
       if (ctx.pageUrl && isRecaptchaUrl(ctx.pageUrl)) ctx.pageUrl = null;
+
+      // 4) まだ不明なら、開いているウィンドウのうち reCAPTCHA 以外の本来のページを探す
+      if (!ctx.pageUrl && global.clients) {
+        try {
+          const wins = await global.clients.matchAll({ type: 'window', includeUncontrolled: true });
+          for (const w of wins) {
+            const u = safeDecode(w.url);
+            if (u && !isRecaptchaUrl(u) && u.hostname !== proxyHost) {
+              // 可視中・フォーカス中のウィンドウを優先
+              if (!ctx.pageUrl || w.focused) ctx.pageUrl = u;
+            }
+          }
+        } catch (_) { /* noop */ }
+      }
+      if (debug) console.log('[recaptcha-compat] ctx', ctx.realUrl.href, '← page:', ctx.pageUrl && ctx.pageUrl.href);
       return ctx;
     }
 
@@ -139,8 +155,13 @@
         let currentHost = null;
         try { currentHost = current && new URL(current).hostname; } catch (_) { /* noop */ }
 
-        if (ctx.pageUrl && (currentHost === proxyHost || !currentHost)) {
+        if (debug) console.log('[recaptcha-compat] co =', current, '| proxyHost =', proxyHost, '| page =', ctx.pageUrl && ctx.pageUrl.origin);
+
+        if (ctx.pageUrl && (currentHost === proxyHost || !currentHost || opts.forceCo)) {
           url.searchParams.set('co', encodeCo(ctx.pageUrl.origin));
+          if (debug) console.log('[recaptcha-compat] co rewritten →', ctx.pageUrl.origin);
+        } else if (!ctx.pageUrl && debug) {
+          console.warn('[recaptcha-compat] 埋め込み元ページを特定できず co を書き換えられません');
         }
       }
 
