@@ -97,13 +97,43 @@
 
     // 診断ログ（直近200件をメモリに保持）
     const logs = [];
+    let channel = null;
+    try {
+      if (debug && typeof BroadcastChannel !== 'undefined') {
+        channel = new BroadcastChannel('rc-debug');
+        // ページ側オーバーレイが開いたとき、過去ログを送る
+        channel.onmessage = (e) => {
+          if (e.data && e.data.type === 'hello') channel.postMessage({ type: 'history', lines: logs.slice() });
+        };
+      }
+    } catch (_) { channel = null; }
+
     function log() {
       if (!debug) return;
-      const line = new Date().toISOString() + ' ' +
+      const line = new Date().toISOString().slice(11, 23) + ' ' +
         Array.prototype.map.call(arguments, (x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ');
       logs.push(line);
       if (logs.length > 200) logs.shift();
+      if (channel) { try { channel.postMessage({ type: 'log', line }); } catch (_) { /* noop */ } }
       try { console.log(line); } catch (_) { /* noop */ }
+    }
+
+    /**
+     * debug:true のとき、HTML レスポンスにオーバーレイ用 <script> を差し込む。
+     * プロキシ側の書き換え（UV等）が済んだあとのレスポンスに対して呼ぶこと。
+     *   response = await recaptcha.injectOverlay(response);
+     */
+    async function injectOverlay(response) {
+      if (!debug) return response;
+      const ct = response.headers.get('content-type') || '';
+      if (!/text\/html/i.test(ct)) return response;
+      const html = await response.text();
+      const tag = '<script src="' + proxyOrigin + '/recaptcha-debug-overlay.js"></script>';
+      const out = /<head[^>]*>/i.test(html) ? html.replace(/<head[^>]*>/i, (m) => m + tag) : tag + html;
+      const headers = new Headers(response.headers);
+      headers.delete('content-length');
+      headers.delete('content-encoding');
+      return new Response(out, { status: response.status, statusText: response.statusText, headers });
     }
 
     /**
@@ -217,7 +247,7 @@
       });
     }
 
-    return { createContext, rewriteRequest, rewriteResponse, handleDebug, isRecaptchaUrl, encodeCo, decodeCo };
+    return { createContext, rewriteRequest, rewriteResponse, handleDebug, injectOverlay, isRecaptchaUrl, encodeCo, decodeCo };
   }
 
   global.createRecaptchaCompat = createRecaptchaCompat;
