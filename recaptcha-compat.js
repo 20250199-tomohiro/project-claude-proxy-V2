@@ -93,7 +93,30 @@
     const proxyOrigin = opts.proxyOrigin;
     const proxyHost = new URL(proxyOrigin).hostname;
     const decodeUrl = opts.decodeUrl; // proxyUrl(string) -> realUrl(string)
-    const debug = !!opts.debug;       // true で SW のコンソールに診断ログを出す
+    const debug = !!opts.debug;       // true で診断ログを記録する（DevTools なしでも /__rc-debug で閲覧可）
+
+    // 診断ログ（直近200件をメモリに保持）
+    const logs = [];
+    function log() {
+      if (!debug) return;
+      const line = new Date().toISOString() + ' ' +
+        Array.prototype.map.call(arguments, (x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ');
+      logs.push(line);
+      if (logs.length > 200) logs.shift();
+      try { console.log(line); } catch (_) { /* noop */ }
+    }
+
+    /**
+     * `<プロキシのオリジン>/__rc-debug` を開くとログがテキストで見られる。
+     * fetch ハンドラの先頭で呼ぶ: const d = recaptcha.handleDebug(event.request); if (d) return d;
+     */
+    function handleDebug(request) {
+      const u = new URL(request.url);
+      if (u.origin !== proxyOrigin || u.pathname !== '/__rc-debug') return null;
+      if (u.searchParams.has('clear')) logs.length = 0;
+      const body = logs.length ? logs.join('\n') : '(ログなし: reCAPTCHA関連のリクエストがまだ処理されていません)';
+      return new Response(body, { headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } });
+    }
 
     function safeDecode(u) {
       try {
@@ -140,7 +163,7 @@
           }
         } catch (_) { /* noop */ }
       }
-      if (debug) console.log('[recaptcha-compat] ctx', ctx.realUrl.href, '← page:', ctx.pageUrl && ctx.pageUrl.href);
+      log('[ctx]', ctx.realUrl.href, '<- page:', ctx.pageUrl ? ctx.pageUrl.href : null);
       return ctx;
     }
 
@@ -155,13 +178,13 @@
         let currentHost = null;
         try { currentHost = current && new URL(current).hostname; } catch (_) { /* noop */ }
 
-        if (debug) console.log('[recaptcha-compat] co =', current, '| proxyHost =', proxyHost, '| page =', ctx.pageUrl && ctx.pageUrl.origin);
+        log('[co] co =', current, '| proxyHost =', proxyHost, '| page =', ctx.pageUrl ? ctx.pageUrl.origin : null);
 
         if (ctx.pageUrl && (currentHost === proxyHost || !currentHost || opts.forceCo)) {
           url.searchParams.set('co', encodeCo(ctx.pageUrl.origin));
-          if (debug) console.log('[recaptcha-compat] co rewritten →', ctx.pageUrl.origin);
-        } else if (!ctx.pageUrl && debug) {
-          console.warn('[recaptcha-compat] 埋め込み元ページを特定できず co を書き換えられません');
+          log('[co] rewritten ->', ctx.pageUrl.origin);
+        } else if (!ctx.pageUrl) {
+          log('[co] WARN: 埋め込み元ページを特定できず co を書き換えられません');
         }
       }
 
@@ -184,6 +207,7 @@
 
     /** レスポンスのヘッダを iframe 表示可能にして返す */
     function rewriteResponse(ctx, response) {
+      log('[res]', response.status, ctx.realUrl.hostname + ctx.realUrl.pathname);
       const headers = new Headers(response.headers);
       for (const h of STRIP_RESPONSE_HEADERS) headers.delete(h);
       return new Response(response.body, {
@@ -193,7 +217,7 @@
       });
     }
 
-    return { createContext, rewriteRequest, rewriteResponse, isRecaptchaUrl, encodeCo, decodeCo };
+    return { createContext, rewriteRequest, rewriteResponse, handleDebug, isRecaptchaUrl, encodeCo, decodeCo };
   }
 
   global.createRecaptchaCompat = createRecaptchaCompat;
