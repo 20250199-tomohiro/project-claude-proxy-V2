@@ -1815,7 +1815,12 @@ function buildUpstreamHeaders(req, target, sess) {
     if (req.headers['sec-fetch-user']) h['sec-fetch-user'] = req.headers['sec-fetch-user'];
     let site = 'same-origin';
     if (!ref) {
-      site = sfm === 'navigate' ? 'none' : 'same-origin';
+      if (sfm === 'navigate') {
+        // 本物のブラウザでは iframe / frame の移動で none になることはない (埋め込み元は別サイト扱い)
+        site = sfd === 'iframe' || sfd === 'frame' || sfd === 'embed' || sfd === 'object' ? 'cross-site' : 'none';
+      } else {
+        site = 'same-origin';
+      }
     } else {
       try {
         const ro = new URL(ref);
@@ -1892,8 +1897,10 @@ function handleProxy(req, res, target) {
         const sn = [].concat(ur.headers['set-cookie'] || []).map((s) => String(s).split('=')[0]).join(',');
         const cn = upHeaders.cookie ? upHeaders.cookie.split(';').map((s) => s.trim().split('=')[0]).join(',') : '';
         const loc = ur.headers.location ? ' -> ' + String(ur.headers.location).split('?')[0].slice(0, 100) : '';
+        const sf = [upHeaders['sec-fetch-site'], upHeaders['sec-fetch-mode'], upHeaders['sec-fetch-dest']].join('/');
+        const wa = ur.headers['www-authenticate'] ? ' www-auth=' + String(ur.headers['www-authenticate']).slice(0, 80) : '';
         pxLog(
-          `[google] ${req.method} ${status} ${target.hostname}${target.pathname.slice(0, 70)}${loc} | sent=[${cn}] set=[${sn}]`
+          `[google] ${req.method} ${status} ${target.hostname}${target.pathname.slice(0, 70)}${loc} | sent=[${cn}] set=[${sn}] sf=${sf} ref=${upHeaders.referer ? 'y' : 'n'} origin=${upHeaders.origin ? 'y' : 'n'}${wa}`
         );
       }
       if (rcIs) {
