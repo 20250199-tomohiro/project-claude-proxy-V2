@@ -2216,12 +2216,42 @@ function ytCleanErr(s) {
   return (err.length ? err.slice(-2) : lines.slice(-2)).join(' ').slice(0, 500) || 'yt-dlp が失敗しました';
 }
 
+// yt-dlp に実行権限が無い (EACCES) とき: chmod し、それも駄目なら書き込み可能な場所へコピーして使う
+let ytBin = YT_DLP;
+let ytFixTried = false;
+function ytFixBin() {
+  try {
+    fs.chmodSync(ytBin, 0o755);
+    return true;
+  } catch (e) {}
+  try {
+    const t = pathMod.join(os.tmpdir(), 'yt-dlp');
+    fs.copyFileSync(ytBin, t);
+    fs.chmodSync(t, 0o755);
+    ytBin = t;
+    return true;
+  } catch (e) {}
+  return false;
+}
+if (fs.existsSync(YT_DLP)) {
+  try {
+    fs.accessSync(YT_DLP, fs.constants.X_OK);
+  } catch (e) {
+    ytFixTried = true;
+    console.warn('[yt] yt-dlp に実行権限がありません。付与します: ' + (ytFixBin() ? 'OK' : '失敗'));
+  }
+}
+
 function ytExec(target, extra) {
   return new Promise((resolve, reject) => {
     const args = ['-J', '--no-warnings', '--socket-timeout', '20', '--cache-dir', pathMod.join(os.tmpdir(), 'yt-dlp-cache')].concat(extra);
     if (YT_COOKIES) args.push('--cookies', YT_COOKIES);
     args.push(target);
-    execFile(YT_DLP, args, { timeout: 120000, maxBuffer: 64 * 1024 * 1024, env: process.env }, (err, stdout, stderr) => {
+    execFile(ytBin, args, { timeout: 120000, maxBuffer: 64 * 1024 * 1024, env: process.env }, (err, stdout, stderr) => {
+      if (err && err.code === 'EACCES' && !ytFixTried) {
+        ytFixTried = true;
+        if (ytFixBin()) return ytExec(target, extra).then(resolve, reject);
+      }
       if (err) {
         const e = new Error(
           err.code === 'ENOENT'
