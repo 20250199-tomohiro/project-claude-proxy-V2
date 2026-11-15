@@ -62,6 +62,12 @@ try {
   console.warn('[rc] recaptcha-compat.js の初期化に失敗: ' + e.message);
 }
 // オリジン (ホスト名) ごとにインスタンスを持つ: proxyOrigin / ログが別々になるため
+const GOOGLE_RE = /(^|\.)(google\.[a-z.]+|gstatic\.com|googleusercontent\.com|googleapis\.com|youtube\.com)$/i;
+const pxLogs = [];
+function pxLog(line) {
+  pxLogs.push(new Date().toISOString().slice(11, 23) + ' ' + line);
+  if (pxLogs.length > 300) pxLogs.shift();
+}
 const rcCompats = new Map();
 function getRc(req) {
   if (!RC_COMPAT_OK) return null;
@@ -1881,6 +1887,15 @@ function handleProxy(req, res, target) {
     (ur) => {
       clearTimeout(timer);
       const status = ur.statusCode;
+      // Google 宛ての通信をサーバー側で記録 (Cookie は名前だけ。値は残さない)
+      if (RC_DEBUG && GOOGLE_RE.test(target.hostname)) {
+        const sn = [].concat(ur.headers['set-cookie'] || []).map((s) => String(s).split('=')[0]).join(',');
+        const cn = upHeaders.cookie ? upHeaders.cookie.split(';').map((s) => s.trim().split('=')[0]).join(',') : '';
+        const loc = ur.headers.location ? ' -> ' + String(ur.headers.location).split('?')[0].slice(0, 100) : '';
+        pxLog(
+          `[google] ${req.method} ${status} ${target.hostname}${target.pathname.slice(0, 70)}${loc} | sent=[${cn}] set=[${sn}]`
+        );
+      }
       if (rcIs) {
         try {
           rc.rewriteResponse(rcCtx, new Response(null, { status })); // ログ記録のみ (ヘッダ除去はこの後の処理で実施済み)
@@ -2069,16 +2084,17 @@ const server = http.createServer(async (req, res) => {
     // サーバー側 (reCAPTCHA 互換モジュール) のログ。/__rc-debug を直接開いても見られる (?clear で消去)
     if (path === '/~/rc-debug' || path === '/__rc-debug') {
       const rc = getRc(req);
+      const qs = req.url.includes('?') ? '?' + req.url.split('?')[1] : '';
+      if (/[?&]clear\b/.test(qs)) pxLogs.length = 0;
+      let rcText = '';
       if (rc) {
         const origin = (isSecure(req) ? 'https' : 'http') + '://' + req.headers.host;
-        const r = rc.handleDebug(new Request(origin + '/__rc-debug' + (req.url.includes('?') ? '?' + req.url.split('?')[1] : '')));
-        if (r) {
-          res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
-          return res.end(await r.text());
-        }
+        const r = rc.handleDebug(new Request(origin + '/__rc-debug' + qs));
+        if (r) rcText = await r.text();
       }
+      const body = pxLogs.concat(rcText && rcText.charAt(0) !== '(' ? [rcText] : []).join('\n');
       res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
-      return res.end('(reCAPTCHA 互換モジュールが無効です)');
+      return res.end(body || '(ログなし: Google / reCAPTCHA 宛ての通信がまだありません)');
     }
     if (path === '/~/client.js') {
       res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8', 'cache-control': 'no-cache' });
