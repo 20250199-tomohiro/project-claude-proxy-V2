@@ -178,6 +178,27 @@ function clientMain() {
 
   var nativeFetch = window.fetch;
 
+  // フック前のネイティブ関数を控えておく (末尾で toString() を native code に見せるために使う)
+  var NAT = {
+    fetch: window.fetch,
+    xopen: XMLHttpRequest.prototype.open,
+    xsend: XMLHttpRequest.prototype.send,
+    beacon: navigator.sendBeacon,
+    wopen: window.open,
+    push: history.pushState,
+    replace: history.replaceState,
+    setAttr: Element.prototype.setAttribute,
+    WS: window.WebSocket,
+    Worker: window.Worker,
+    SharedWorker: window.SharedWorker,
+    ES: window.EventSource,
+    dopen: Document.prototype.open,
+    cerr: console.error
+  };
+  var nativeToStr = Function.prototype.toString;
+  // Google ログインは Google のドメインかどうか (WebRTC 無効化など、挙動を変える判断に使う)
+  var IS_GOOGLE = /(^|\.)(google\.[a-z.]+|gstatic\.com|googleusercontent\.com|googleapis\.com|youtube\.com)$/i.test(curT().hostname);
+
   /* --- fetch --- */
   if (nativeFetch) {
     window.fetch = function (input, init) {
@@ -486,7 +507,9 @@ function clientMain() {
   }
 
   /* --- 外部への直接通信を作らせない: WebRTC / WebTransport を無効化 --- */
+  // (Google 系ドメインでは無効化しない: これらが undefined だと不自然な環境として判定され、ログインが弾かれる原因になる)
   ['RTCPeerConnection', 'webkitRTCPeerConnection', 'RTCDataChannel', 'WebTransport'].forEach(function (n) {
+    if (IS_GOOGLE) return;
     try {
       Object.defineProperty(window, n, { configurable: true, writable: true, value: undefined });
     } catch (e) {}
@@ -768,6 +791,36 @@ function clientMain() {
       window.WebSocket = W3;
     }
   })();
+
+  /* --- フックした関数の toString() を native code に見せる ---
+   *  Google ログインの BotGuard は fetch / XHR などが書き換えられていないかを
+   *  Function.prototype.toString で確認するため、素のままだと「エラーが発生しました」で弾かれる */
+  try {
+    var fakes = new WeakMap();
+    var pair = function (f, o) {
+      if (typeof f === 'function' && typeof o === 'function' && f !== o) fakes.set(f, o);
+    };
+    pair(window.fetch, NAT.fetch);
+    pair(XMLHttpRequest.prototype.open, NAT.xopen);
+    pair(XMLHttpRequest.prototype.send, NAT.xsend);
+    pair(navigator.sendBeacon, NAT.beacon);
+    pair(window.open, NAT.wopen);
+    pair(history.pushState, NAT.push);
+    pair(history.replaceState, NAT.replace);
+    pair(Element.prototype.setAttribute, NAT.setAttr);
+    pair(window.WebSocket, NAT.WS);
+    pair(window.Worker, NAT.Worker);
+    pair(window.SharedWorker, NAT.SharedWorker);
+    pair(window.EventSource, NAT.ES);
+    pair(Document.prototype.open, NAT.dopen);
+    pair(console.error, NAT.cerr);
+    var fakeToString = function toString() {
+      var o = fakes.get(this);
+      return nativeToStr.call(o || this);
+    };
+    fakes.set(fakeToString, nativeToStr);
+    Function.prototype.toString = fakeToString;
+  } catch (e) {}
 }
 
 /* ---------- トップページのスクリプト ---------- */
@@ -1677,6 +1730,30 @@ function buildUpstreamHeaders(req, target, sess) {
       } catch (e) {}
     }
     h.origin = o;
+  }
+
+  // Sec-Fetch-*: ブラウザが付けた値は「プロキシ ↔ プロキシ」の関係なので、元サイトから見た関係に直して送る
+  //  (Google は Sec-Fetch-* の欠落・不整合も不審な環境の判定材料にする)
+  const sfm = req.headers['sec-fetch-mode'];
+  const sfd = req.headers['sec-fetch-dest'];
+  if (sfm) {
+    h['sec-fetch-mode'] = sfm;
+    if (sfd) h['sec-fetch-dest'] = sfd;
+    if (req.headers['sec-fetch-user']) h['sec-fetch-user'] = req.headers['sec-fetch-user'];
+    let site = 'same-origin';
+    if (!ref) {
+      site = sfm === 'navigate' ? 'none' : 'same-origin';
+    } else {
+      try {
+        const ro = new URL(ref);
+        if (ro.origin === target.origin) site = 'same-origin';
+        else {
+          const reg = (x) => x.hostname.split('.').slice(-2).join('.');
+          site = reg(ro) === reg(target) ? 'same-site' : 'cross-site';
+        }
+      } catch (e) {}
+    }
+    h['sec-fetch-site'] = site;
   }
   return h;
 }
