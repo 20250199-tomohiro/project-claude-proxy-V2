@@ -2309,19 +2309,81 @@ function ytBuild(j) {
 }
 
 // yt-dlp を同時実行数の上限内で実行する (動画の解決・検索で共用)
-async function ytRun(target, extra) {
+async function ytExecRt(target, extra) {
+  try {
+    return await ytExec(target, extra.concat(YT_RT_ARGS));
+  } catch (e) {
+    // 古い yt-dlp は JS ランタイム用のオプションを知らない → 付けずにやり直す
+    if (/no such option|unrecognized arguments/i.test(e.stderr || '')) return await ytExec(target, extra);
+    throw e;
+  }
+}
+
+// YouTube は方式 (player client) ごとに「ボット確認」「PO トークン要求」などの扱いが違う。
+// 既定の方式が失敗したら、別の方式で順に試す。成功した方式は次回から最初に使う。
+const YT_CLIENTS = ['', 'android_vr', 'tv', 'web_safari', 'mweb']; // '' = yt-dlp の既定
+const YT_RETRY_RE = /player response|Sign in to confirm|not available on this app|HTTP Error 4\d\d|Requested format|n challenge|Unable to download (?:webpage|API)|Precondition check failed|This video is not available/i;
+let ytGoodClient = null;
+let ytLastErr = null;
+
+async function ytRun(target, extra, multi) {
   await ytAcquire();
   try {
-    try {
-      return await ytExec(target, extra.concat(YT_RT_ARGS));
-    } catch (e) {
-      // 古い yt-dlp は JS ランタイム用のオプションを知らない → 付けずにやり直す
-      if (/no such option|unrecognized arguments/i.test(e.stderr || '')) return await ytExec(target, extra);
-      throw e;
+    let order = [''];
+    if (multi) order = ytGoodClient === null ? YT_CLIENTS : [ytGoodClient].concat(YT_CLIENTS.filter((c) => c !== ytGoodClient));
+    const t0 = Date.now();
+    const tried = [];
+    let lastErr = null;
+    for (const c of order) {
+      if (tried.length && Date.now() - t0 > 100000) break; // 全体で長引かせない
+      tried.push(c || 'default');
+      try {
+        const j = await ytExecRt(target, c ? extra.concat(['--extractor-args', 'youtube:player_client=' + c]) : extra);
+        if (multi) ytGoodClient = c;
+        return j;
+      } catch (e) {
+        lastErr = e;
+        if (!multi || !YT_RETRY_RE.test(e.message + ' ' + (e.stderr || ''))) break;
+      }
     }
+    if (multi && tried.length > 1) lastErr.message += ' [試した方式: ' + tried.join(', ') + ']';
+    ytLastErr = { t: new Date().toISOString(), target: target.replace(/^https:\/\/www\.youtube\.com\/watch\?v=/, ''), msg: lastErr.message };
+    throw lastErr;
   } finally {
     ytRelease();
   }
+}
+
+// yt-dlp の自動更新 (YouTube の変更に追従するため、起動直後と 12 時間ごと)。YT_AUTO_UPDATE=0 で無効
+const YT_CHANNEL = process.env.YT_UPDATE_CHANNEL || 'nightly'; // stable / nightly / master
+function ytUpdate() {
+  if (!fs.existsSync(ytBin)) return;
+  execFile(ytBin, ['--update-to', YT_CHANNEL], { timeout: 120000 }, (err, out, errOut) => {
+    const msg = (String(out || '') + String(errOut || '')).trim().split('\n').slice(-2).join(' | ');
+    console.log('[yt] yt-dlp update (' + YT_CHANNEL + '): ' + (msg || (err && err.message) || 'done'));
+    if (!err) ytCache.clear();
+  });
+}
+if (process.env.YT_AUTO_UPDATE !== '0') {
+  setTimeout(ytUpdate, 5000).unref();
+  setInterval(ytUpdate, 12 * 3600 * 1000).unref();
+}
+
+// 診断: /~/yt/diag を開くと、yt-dlp の状態と直近のエラーが見られる
+function ytDiag(cb) {
+  const lines = [
+    'yt-dlp path : ' + ytBin + (fs.existsSync(ytBin) ? '' : '  (見つかりません)'),
+    'node        : ' + process.version,
+    'cookies     : ' + (YT_COOKIES ? 'あり' : 'なし'),
+    'auto update : ' + (process.env.YT_AUTO_UPDATE !== '0' ? YT_CHANNEL : '無効'),
+    'good client : ' + (ytGoodClient === null ? '(未確定)' : ytGoodClient || 'default'),
+    'running/queue: ' + ytRunning + '/' + ytQueue.length,
+    'last error  : ' + (ytLastErr ? ytLastErr.t + ' [' + ytLastErr.target + '] ' + ytLastErr.msg : '(なし)')
+  ];
+  execFile(ytBin, ['--version'], { timeout: 20000 }, (err, out) => {
+    lines.unshift('yt-dlp version: ' + (err ? 'ERROR ' + err.message : String(out).trim()));
+    cb(lines.join('\n'));
+  });
 }
 
 // 検索: yt-dlp の ytsearchN: を使う (--flat-playlist で一覧だけ高速に取得)
@@ -2352,7 +2414,7 @@ function ytGet(id) {
   let p = ytJobs.get(id);
   if (p) return p;
   p = (async () => {
-    const j = await ytRun('https://www.youtube.com/watch?v=' + id, ['--no-playlist']);
+    const j = await ytRun('https://www.youtube.com/watch?v=' + id, ['--no-playlist'], true);
     if (j.is_live) throw new Error('ライブ配信には未対応です');
     const r = ytBuild(j);
     if (!r.info.formats.length) throw new Error('再生できる形式が見つかりませんでした');
@@ -2574,10 +2636,17 @@ function ytViewerMain() {
     var p = V.play();
     if (p && p.catch)
       p.catch(function (e) {
-        showMsg('再生できません: ' + e.message, true);
+        // 再生開始と同時に一時停止/読み込み直しが入った場合 (AbortError) は異常ではないので表示しない
+        if (e && e.name === 'AbortError') return;
+        showMsg('再生できません: ' + (e && e.message), true);
       });
   }
+  var lastToggle = 0;
   function toggle() {
+    if (!V.getAttribute('src')) return; // まだ動画情報の取得中
+    var now = Date.now();
+    if (now - lastToggle < 250) return; // 二重反応 (ダブルクリック・ボタンとキーの重複) を無視
+    lastToggle = now;
     if (V.paused) play();
     else V.pause();
   }
@@ -2685,9 +2754,16 @@ function ytViewerMain() {
     dragging = false;
   });
   $('pp').addEventListener('click', toggle);
-  $('big').addEventListener('click', toggle);
-  V.addEventListener('click', toggle);
-  V.addEventListener('dblclick', fullscreen);
+  // 映像のクリック: ダブルクリック (全画面) と区別するため、少し待ってから再生/停止する
+  var clickTimer = null;
+  V.addEventListener('click', function () {
+    clearTimeout(clickTimer);
+    clickTimer = setTimeout(toggle, 250);
+  });
+  V.addEventListener('dblclick', function () {
+    clearTimeout(clickTimer);
+    fullscreen();
+  });
   $('fs').addEventListener('click', fullscreen);
   $('mute').addEventListener('click', function () {
     setVol(V.volume || 1, !V.muted);
@@ -2706,6 +2782,7 @@ function ytViewerMain() {
   document.addEventListener('keydown', function (ev) {
     var tg = ev.target && ev.target.tagName;
     if (tg === 'SELECT' || tg === 'TEXTAREA' || (tg === 'INPUT' && ev.target.type === 'text') || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    if (tg === 'BUTTON' && (ev.key === ' ' || ev.key === 'Enter')) return; // フォーカス中のボタン自身の動作に任せる
     var k = ev.key, used = true;
     if (k === ' ' || k === 'k') toggle();
     else if (k === 'ArrowLeft') seekBy(-5);
@@ -2790,6 +2867,7 @@ const YT_VIEWER_HTML = `<!doctype html>
   #v{width:100%;height:100%;object-fit:contain;display:block;background:#000}
   #big{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:72px;height:72px;border-radius:50%;
     background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;font-size:30px;cursor:pointer}
+  #big{pointer-events:none}
   #box.paused #big{display:flex}
   #msg{position:absolute;left:12px;right:12px;top:12px;padding:8px 12px;border-radius:8px;background:rgba(0,0,0,.7);font-size:13px;line-height:1.5}
   #msg.err{background:rgba(198,40,40,.9)}
@@ -2843,6 +2921,7 @@ const YT_VIEWER_HTML = `<!doctype html>
   <div id="hint">
     「ボットではないことを確認」などと出る場合は、サーバー (Render) の IP が YouTube に制限されています。
     環境変数 YT_COOKIES_FILE に cookies.txt を設定すると改善することがあります。
+    原因の切り分けには <a href="/~/yt/diag" style="color:#8fb0ff">診断ページ</a> を開いてください。
   </div>
 </div>
 <script>window.__YT=__CFG__;</script>
@@ -3120,6 +3199,12 @@ const server = http.createServer(async (req, res) => {
     if (path === '/~/yt') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
       return res.end(YT_HOME_HTML);
+    }
+    if (path === '/~/yt/diag') {
+      return ytDiag((text) => {
+        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+        res.end(text);
+      });
     }
     if (path === '/~/yt/search') {
       const qs = new URL(req.url, 'http://x').searchParams;
