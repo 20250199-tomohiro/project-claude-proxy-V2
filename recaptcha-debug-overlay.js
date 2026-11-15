@@ -65,6 +65,26 @@
     return origErr.apply(console, arguments);
   };
 
+  // ---- プロキシサーバー側 (recaptcha-compat) のログ取得 ----
+  // サーバー側のログは BroadcastChannel では届かないため HTTP で定期取得する。
+  // /~/ 配下はプロキシのフックを素通りするパス。
+  var seen = {};
+  function pollServer() {
+    if (document.visibilityState === 'hidden' || !window.fetch) return;
+    fetch('/~/rc-debug', { cache: 'no-store', credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.text() : ''; })
+      .then(function (t) {
+        t.split('\n').forEach(function (l) {
+          if (!l || l.charAt(0) === '(' || seen[l]) return;
+          seen[l] = 1;
+          add('[server] ' + l);
+        });
+      })
+      .catch(function () { /* noop */ });
+  }
+  setInterval(pollServer, 3000);
+  pollServer();
+
   // ---- UI ----
   var host = document.createElement('div');
   host.style.cssText = 'all:initial;position:fixed;right:12px;bottom:12px;z-index:2147483647;';

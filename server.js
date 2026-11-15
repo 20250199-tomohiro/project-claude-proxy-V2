@@ -27,6 +27,9 @@ const dns = require('dns');
 const net = require('net');
 const crypto = require('crypto');
 const { WebSocketServer, WebSocket } = require('ws');
+const fs = require('fs');
+const pathMod = require('path');
+const vm = require('vm');
 
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 const BASIC_AUTH = process.env.BASIC_AUTH || '';
@@ -35,6 +38,50 @@ const PREFIX = '/go/';
 const SID_NAME = '__pxsid';
 const MAX_REWRITE = 30 * 1024 * 1024; // HTML/CSS を書き換える際の上限
 const UPSTREAM_TIMEOUT = 30000; // 応答ヘッダが来るまでの待ち時間
+
+/* ---- reCAPTCHA 互換モジュール / デバッグオーバーレイ (同じフォルダの .js を読み込む) ----
+ *  RC_DEBUG=0 でデバッグオーバーレイとログを無効化 (既定は有効) */
+const RC_DEBUG = process.env.RC_DEBUG !== '0';
+function loadLocal(name) {
+  try {
+    return fs.readFileSync(pathMod.join(__dirname, name), 'utf8');
+  } catch (e) {
+    console.warn('[rc] ' + name + ' を読み込めませんでした: ' + e.message);
+    return null;
+  }
+}
+const RC_OVERLAY_SRC = loadLocal('recaptcha-debug-overlay.js');
+let RC_COMPAT_OK = false;
+try {
+  const src = loadLocal('recaptcha-compat.js');
+  if (src) {
+    vm.runInThisContext(src, { filename: 'recaptcha-compat.js' });
+    RC_COMPAT_OK = typeof globalThis.createRecaptchaCompat === 'function';
+  }
+} catch (e) {
+  console.warn('[rc] recaptcha-compat.js の初期化に失敗: ' + e.message);
+}
+// オリジン (ホスト名) ごとにインスタンスを持つ: proxyOrigin / ログが別々になるため
+const rcCompats = new Map();
+function getRc(req) {
+  if (!RC_COMPAT_OK) return null;
+  const host = String(req.headers.host || '');
+  const origin = (isSecure(req) ? 'https' : 'http') + '://' + host;
+  let c = rcCompats.get(origin);
+  if (!c) {
+    try {
+      c = globalThis.createRecaptchaCompat({
+        proxyOrigin: origin,
+        decodeUrl: (u) => decodeProxyUrl(u, host),
+        debug: RC_DEBUG
+      });
+    } catch (e) {
+      return null;
+    }
+    rcCompats.set(origin, c);
+  }
+  return c;
+}
 
 /* ========================================================================
  *  ブラウザ側コード (関数として書いて toString() で埋め込む)
@@ -74,7 +121,7 @@ function swMain() {
     if (url.origin === self.location.origin) {
       var p = url.pathname;
       // プロキシ済み / サーバー自身のパスはそのままネットワークへ
-      if (p.indexOf('/go/') === 0 || p.indexOf('/~/') === 0 || p === '/' || p === '/sw.js' || p === '/healthz') return;
+      if (p.indexOf('/go/') === 0 || p.indexOf('/~/') === 0 || p === '/' || p === '/sw.js' || p === '/healthz' || p === '/__rc-debug') return;
     }
     e.respondWith(rescue(e, req, url));
   });
@@ -1415,13 +1462,30 @@ const agentOpts = { keepAlive: true, lookup: safeLookup, maxSockets: 256 };
 const httpAgent = new http.Agent(agentOpts);
 const httpsAgent = new https.Agent(agentOpts);
 
-function authOk(req) {
+// Basic 認証に成功したら Cookie も発行する。
+// Google などのページは fetch に独自の Authorization ヘッダ (SAPISIDHASH 等) を付けるため、
+// ブラウザ自動の Basic 認証ヘッダが上書きされて 401 になる。Cookie なら上書きされない。
+const AUTH_COOKIE = '__pxauth';
+const AUTH_TOKEN = BASIC_AUTH ? crypto.createHash('sha256').update('pxauth:' + BASIC_AUTH).digest('hex') : '';
+
+function authOk(req, res) {
   if (!BASIC_AUTH) return true;
+  const ck = parseCookieHeader(req.headers.cookie)[AUTH_COOKIE];
+  if (ck && ck.length === AUTH_TOKEN.length && crypto.timingSafeEqual(Buffer.from(ck), Buffer.from(AUTH_TOKEN))) return true;
   const h = req.headers.authorization || '';
   if (!h.startsWith('Basic ')) return false;
   const a = Buffer.from(Buffer.from(h.slice(6), 'base64').toString());
   const b = Buffer.from(BASIC_AUTH);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+  if (ok && res) {
+    addSetCookie(res, `${AUTH_COOKIE}=${AUTH_TOKEN}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${isSecure(req) ? '; Secure' : ''}`);
+  }
+  return ok;
+}
+
+function addSetCookie(res, c) {
+  const prev = res.getHeader('Set-Cookie');
+  res.setHeader('Set-Cookie', prev ? [].concat(prev, c) : c);
 }
 
 function isSecure(req) {
@@ -1499,8 +1563,8 @@ function getSession(req, res, create) {
     s = { jar: [], last: null, t: Date.now() };
     sessions.set(nsid, s);
     if (res) {
-      res.setHeader(
-        'Set-Cookie',
+      addSetCookie(
+        res,
         `${SID_NAME}=${nsid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${isSecure(req) ? '; Secure' : ''}`
       );
     }
@@ -1676,8 +1740,10 @@ function rewriteHtml(html, baseHref, cookieStr) {
   }
   out += rewriteAttrs(html.slice(last), base);
 
+  // デバッグオーバーレイ (recaptcha-debug-overlay.js) は client.js より先に読み込む
   const inj =
     '<script>window.__PX_COOKIE=' + JSON.stringify(cookieStr || '').replace(/</g, '\\u003c') + ';</script>' +
+    (RC_DEBUG && RC_OVERLAY_SRC ? '<script src="/~/rc-overlay.js"></script>' : '') +
     '<script src="/~/client.js"></script>';
   let mm = /<head(\s[^>]*)?>/i.exec(out) || /<html(\s[^>]*)?>/i.exec(out);
   if (mm) {
@@ -1708,7 +1774,8 @@ function buildUpstreamHeaders(req, target, sess) {
   const h = {};
   for (const [k, v] of Object.entries(req.headers)) {
     if (SKIP_REQ.test(k)) continue;
-    if (k === 'authorization' && BASIC_AUTH) continue;
+    // プロキシ自身の Basic 認証だけ除外。Google の SAPISIDHASH など他の Authorization は転送する
+    if (k === 'authorization' && BASIC_AUTH && /^basic\s/i.test(String(v))) continue;
     h[k] = v;
   }
   if (req.headers['content-length'] !== undefined) h['content-length'] = req.headers['content-length'];
@@ -1771,8 +1838,36 @@ function errorPage(res, code, msg) {
 
 function handleProxy(req, res, target) {
   const sess = getSession(req, res, true);
+
+  // reCAPTCHA 互換: anchor/bframe の co (埋め込み元オリジン) をプロキシ → 実ページのオリジンへ書き換える
+  const rc = getRc(req);
+  const rcIs = !!(rc && rc.isRecaptchaUrl(target));
+  let rcCtx = null;
+  let rcReferer = null;
+  if (rcIs) {
+    let pageUrl = null;
+    try {
+      const ps = req.headers.referer ? decodeProxyUrl(req.headers.referer, req.headers.host) : null;
+      pageUrl = ps ? new URL(ps) : null;
+    } catch (e) {}
+    // 親が reCAPTCHA 自身 (anchor → bframe 等) のときは、直近に開いた通常ページを埋め込み元とみなす
+    if ((!pageUrl || rc.isRecaptchaUrl(pageUrl)) && sess && sess.lastPage) {
+      try {
+        pageUrl = new URL(sess.lastPage);
+      } catch (e) {}
+    }
+    if (pageUrl && rc.isRecaptchaUrl(pageUrl)) pageUrl = null;
+    rcCtx = { realUrl: target, pageUrl, isRecaptcha: true };
+    try {
+      const r = rc.rewriteRequest(rcCtx, new Headers());
+      target = r.url;
+      rcReferer = r.headers.get('referer');
+    } catch (e) {}
+  }
+
   const isHttps = target.protocol === 'https:';
   const upHeaders = buildUpstreamHeaders(req, target, sess);
+  if (rcReferer) upHeaders.referer = rcReferer;
 
   const up = (isHttps ? https : http).request(
     {
@@ -1786,6 +1881,11 @@ function handleProxy(req, res, target) {
     (ur) => {
       clearTimeout(timer);
       const status = ur.statusCode;
+      if (rcIs) {
+        try {
+          rc.rewriteResponse(rcCtx, new Response(null, { status })); // ログ記録のみ (ヘッダ除去はこの後の処理で実施済み)
+        } catch (e) {}
+      }
 
       // ① Set-Cookie は jar に保存 (ブラウザへは渡さない)
       const sc = ur.headers['set-cookie'];
@@ -1826,7 +1926,10 @@ function handleProxy(req, res, target) {
         return;
       }
 
-      if (isHtml && sess) sess.last = target.origin;
+      if (isHtml && sess) {
+        sess.last = target.origin;
+        if (!rcIs) sess.lastPage = target.origin; // reCAPTCHA の埋め込み元ページ候補
+      }
 
       let stream = ur;
       if (dec) {
@@ -1938,7 +2041,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, { 'content-type': 'text/plain' });
       return res.end('ok');
     }
-    if (!authOk(req)) {
+    if (!authOk(req, res)) {
       res.writeHead(401, { 'www-authenticate': 'Basic realm="proxy", charset="UTF-8"' });
       return res.end('Unauthorized');
     }
@@ -1958,6 +2061,24 @@ const server = http.createServer(async (req, res) => {
         'cache-control': 'no-cache'
       });
       return res.end(SW_JS);
+    }
+    if (path === '/~/rc-overlay.js' && RC_OVERLAY_SRC) {
+      res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8', 'cache-control': 'no-cache' });
+      return res.end(RC_OVERLAY_SRC);
+    }
+    // サーバー側 (reCAPTCHA 互換モジュール) のログ。/__rc-debug を直接開いても見られる (?clear で消去)
+    if (path === '/~/rc-debug' || path === '/__rc-debug') {
+      const rc = getRc(req);
+      if (rc) {
+        const origin = (isSecure(req) ? 'https' : 'http') + '://' + req.headers.host;
+        const r = rc.handleDebug(new Request(origin + '/__rc-debug' + (req.url.includes('?') ? '?' + req.url.split('?')[1] : '')));
+        if (r) {
+          res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+          return res.end(await r.text());
+        }
+      }
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+      return res.end('(reCAPTCHA 互換モジュールが無効です)');
     }
     if (path === '/~/client.js') {
       res.writeHead(200, { 'content-type': 'application/javascript; charset=utf-8', 'cache-control': 'no-cache' });
