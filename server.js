@@ -1902,6 +1902,37 @@ function handleProxy(req, res, target) {
         pxLog(
           `[google] ${req.method} ${status} ${target.hostname}${target.pathname.slice(0, 70)}${loc} | sent=[${cn}] set=[${sn}] sf=${sf} ref=${upHeaders.referer ? 'y' : 'n'} origin=${upHeaders.origin ? 'y' : 'n'}${wa}`
         );
+        if (status >= 400) {
+          // 失敗したときだけ、送ったヘッダ名・返ってきたヘッダ名・本文の見出し部分を記録する (値は記録しない)
+          pxLog(`[google-hdr] ${status} req-h=[${Object.keys(upHeaders).join(',')}] res-h=[${Object.keys(ur.headers).join(',')}] ct=${ur.headers['content-type'] || ''}`);
+          const bufs = [];
+          let got = 0;
+          ur.on('data', (c) => {
+            if (got < 65536) {
+              bufs.push(c);
+              got += c.length;
+            }
+          });
+          ur.on('end', () => {
+            try {
+              let b = Buffer.concat(bufs);
+              const e = String(ur.headers['content-encoding'] || '').toLowerCase();
+              if (e === 'gzip' || e === 'x-gzip') b = zlib.gunzipSync(b);
+              else if (e === 'br') b = zlib.brotliDecompressSync(b);
+              else if (e === 'deflate') b = zlib.inflateSync(b);
+              const txt = b
+                .toString('utf8')
+                .replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, '')
+                .replace(/<[^>]+>/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .slice(0, 300);
+              pxLog(`[google-body] ${status} ${target.pathname.slice(0, 50)} ${txt}`);
+            } catch (err) {
+              pxLog('[google-body] 本文を読めませんでした: ' + err.message);
+            }
+          });
+        }
       }
       if (rcIs) {
         try {
