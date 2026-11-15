@@ -1773,7 +1773,7 @@ function decompressor(enc) {
  *  プロキシ本体 (HTTP)
  * ====================================================================== */
 
-const SKIP_REQ = /^(host|connection|keep-alive|proxy-|te$|trailer|upgrade$|transfer-encoding|sec-fetch-|x-forwarded-|x-render|x-request|rndr|cf-|cdn-loop|true-client-ip|forwarded|via|x-real-ip|accept-encoding|cookie|referer|origin|content-length$)/i;
+const SKIP_REQ = /^(render-|host|connection|keep-alive|proxy-|te$|trailer|upgrade$|transfer-encoding|sec-fetch-|x-forwarded-|x-render|x-request|rndr|cf-|cdn-loop|true-client-ip|forwarded|via|x-real-ip|accept-encoding|cookie|referer|origin|content-length$)/i;
 const SKIP_RES = /^(set-cookie|content-security-policy|content-security-policy-report-only|x-frame-options|strict-transport-security|public-key-pins|public-key-pins-report-only|cross-origin-opener-policy|cross-origin-embedder-policy|cross-origin-resource-policy|connection|keep-alive|transfer-encoding|upgrade|proxy-authenticate|proxy-authorization|te|trailer|alt-svc|link|report-to|nel|expect-ct|clear-site-data|access-control-.*)$/i;
 
 function buildUpstreamHeaders(req, target, sess) {
@@ -1833,7 +1833,19 @@ function buildUpstreamHeaders(req, target, sess) {
     }
     h['sec-fetch-site'] = site;
   }
-  return h;
+
+  // Chrome のヘッダ順に並べ替える (Google は順序もブラウザかどうかの判定材料にする)
+  const ORDER = [
+    'host', 'connection', 'content-length', 'pragma', 'cache-control',
+    'sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform', 'upgrade-insecure-requests',
+    'user-agent', 'content-type', 'accept',
+    'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-user', 'sec-fetch-dest',
+    'origin', 'referer', 'accept-encoding', 'accept-language', 'cookie'
+  ];
+  const sorted = {};
+  for (const k of ORDER) if (h[k] !== undefined) sorted[k] = h[k];
+  for (const k of Object.keys(h)) if (sorted[k] === undefined) sorted[k] = h[k];
+  return sorted;
 }
 
 function errorPage(res, code, msg) {
