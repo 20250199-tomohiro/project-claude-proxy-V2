@@ -30,6 +30,8 @@ const { WebSocketServer, WebSocket } = require('ws');
 const fs = require('fs');
 const pathMod = require('path');
 const vm = require('vm');
+const os = require('os');
+const { execFile } = require('child_process');
 
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 const BASIC_AUTH = process.env.BASIC_AUTH || '';
@@ -251,6 +253,11 @@ function clientMain() {
   var nativeToStr = Function.prototype.toString;
   // Google ログインは Google のドメインかどうか (WebRTC 無効化など、挙動を変える判断に使う)
   var IS_GOOGLE = /(^|\.)(google\.[a-z.]+|gstatic\.com|googleusercontent\.com|googleapis\.com|youtube\.com)$/i.test(curT().hostname);
+  // YouTube: SPA (location.pathname でページを判定する) はプロキシ URL (/go/https/...) では誤動作するため、
+  // サイト内移動はすべて「通常のページ遷移」に置き換える。
+  var YT_RE = /(^|\.)(youtube\.com|youtu\.be|youtube-nocookie\.com)$/i;
+  var IS_YT = YT_RE.test(curT().hostname);
+  var T0 = Date.now();
 
   /* --- fetch --- */
   if (nativeFetch) {
@@ -334,9 +341,47 @@ function clientMain() {
   ['pushState', 'replaceState'].forEach(function (k) {
     var o = history[k];
     history[k] = function (s, t, u) {
-      return o.call(this, s, t, u === undefined || u === null ? u : toProxy(u));
+      var nu = u === undefined || u === null ? u : toProxy(u);
+      // YouTube の SPA 遷移 (pushState) は、ページ全体の読み込みに置き換える
+      // (起動直後 1.5 秒は素通し: 起動処理が pushState を呼んでも無限ループにならないように)
+      if (IS_YT && k === 'pushState' && typeof nu === 'string' && nu.indexOf('/go/') === 0 &&
+          nu !== loc.pathname + loc.search + loc.hash && Date.now() - T0 > 1500) {
+        loc.assign(nu);
+        return;
+      }
+      return o.call(this, s, t, nu);
     };
   });
+  // YouTube 内のリンクは SPA を通さず、そのままページ遷移させる
+  if (IS_YT) {
+    window.addEventListener(
+      'click',
+      function (ev) {
+        try {
+          if (ev.defaultPrevented || ev.button !== 0 || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+          var path = ev.composedPath ? ev.composedPath() : [];
+          var an = null;
+          for (var i = 0; i < path.length; i++) {
+            if (path[i] && path[i].tagName === 'A' && path[i].getAttribute('href')) {
+              an = path[i];
+              break;
+            }
+          }
+          if (!an) return;
+          var tg = (an.getAttribute('target') || '').toLowerCase();
+          if (tg === '_blank' || tg === '_new') return; // 新しいタブ側の既存処理に任せる
+          var np = toProxy(an.getAttribute('href'));
+          if (typeof np !== 'string' || np.indexOf('/go/') !== 0) return;
+          var m = RX.exec(np);
+          if (!m || !YT_RE.test(m[2].split(':')[0])) return; // YouTube 外へのリンクは対象外
+          ev.preventDefault();
+          ev.stopImmediatePropagation();
+          loc.assign(np);
+        } catch (e) {}
+      },
+      true
+    );
+  }
 
   /* --- Worker / EventSource --- */
   ['Worker', 'SharedWorker'].forEach(function (n) {
@@ -1861,6 +1906,7 @@ function errorPage(res, code, msg) {
 
 function handleProxy(req, res, target) {
   const sess = getSession(req, res, true);
+  if (YT_HOST_RE.test(target.hostname)) seedYtCookies(sess);
 
   // reCAPTCHA 互換: anchor/bframe の co (埋め込み元オリジン) をプロキシ → 実ページのオリジンへ書き換える
   const rc = getRc(req);
@@ -2098,6 +2144,656 @@ function readBody(req, limit) {
   });
 }
 
+/* ========================================================================
+ *  YouTube 対応
+ *
+ *  YouTube 本体のページはプロキシ URL (/go/https/www.youtube.com/...) の下では SPA が
+ *  location.pathname からページを判定できず壊れやすい。そのため
+ *    ・トップ / 検索 / チャンネル等 : 通常どおりプロキシ (リンクはクライアント側で通常遷移に変換)
+ *    ・動画 (/watch /shorts /live youtu.be) : 専用プレーヤーに差し替え
+ *  専用プレーヤーは yt-dlp (render.yaml のビルドで bin/yt-dlp に取得) で動画の直リンクを解決し、
+ *  このサーバーが中継する (googlevideo の URL は取得元 IP に紐づくため、必ずサーバー経由にする)。
+ *
+ *  環境変数
+ *   YT_DLP           yt-dlp のパス (既定: ./bin/yt-dlp)
+ *   YT_COOKIES_FILE  Netscape 形式の cookies.txt (「ボットではないことを確認」と出る場合の対策・任意)
+ *   YT_MAX_JOBS      yt-dlp の同時実行数 (既定 2)
+ * ====================================================================== */
+
+const YT_HOST_RE = /(^|\.)(youtube\.com|youtu\.be|youtube-nocookie\.com)$/i;
+const YT_DLP = process.env.YT_DLP || pathMod.join(__dirname, 'bin', 'yt-dlp');
+const YT_MAX = Math.max(1, parseInt(process.env.YT_MAX_JOBS, 10) || 2);
+const YT_TTL = 90 * 60 * 1000; // 解決した直リンクを使い回す時間 (リンク自体は数時間有効)
+const YT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+// 新しい yt-dlp は YouTube の n 署名の解読に JS ランタイムが必要 (Node はこのサーバー自身のものを使う)
+const YT_RT_ARGS = ['--js-runtimes', 'node:' + process.execPath, '--remote-components', 'ejs:github'];
+
+// cookies.txt は yt-dlp が書き戻すことがあるため、書き込み可能な場所へコピーして使う
+let YT_COOKIES = '';
+if (process.env.YT_COOKIES_FILE) {
+  try {
+    YT_COOKIES = pathMod.join(os.tmpdir(), 'yt-cookies.txt');
+    fs.copyFileSync(process.env.YT_COOKIES_FILE, YT_COOKIES);
+  } catch (e) {
+    console.warn('[yt] YT_COOKIES_FILE を読み込めませんでした: ' + e.message);
+    YT_COOKIES = '';
+  }
+}
+
+const ytCache = new Map(); // id -> { t, info, fmts }
+const ytJobs = new Map(); // id -> Promise (同じ動画の同時解決をまとめる)
+const ytQueue = [];
+let ytRunning = 0;
+
+function ytAcquire() {
+  return new Promise((resolve) => {
+    if (ytRunning < YT_MAX) {
+      ytRunning++;
+      resolve();
+    } else ytQueue.push(resolve);
+  });
+}
+function ytRelease() {
+  const next = ytQueue.shift();
+  if (next) next();
+  else ytRunning--;
+}
+
+function ytJson(res, code, obj) {
+  if (res.headersSent) return res.destroy();
+  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(JSON.stringify(obj));
+}
+
+function ytCleanErr(s) {
+  const lines = String(s || '')
+    .replace(/\x1b\[[0-9;]*m/g, '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const err = lines.filter((l) => /^ERROR/i.test(l));
+  return (err.length ? err.slice(-2) : lines.slice(-2)).join(' ').slice(0, 500) || 'yt-dlp が失敗しました';
+}
+
+function ytExec(id, extra) {
+  return new Promise((resolve, reject) => {
+    const args = ['-J', '--no-playlist', '--no-warnings', '--socket-timeout', '20', '--cache-dir', pathMod.join(os.tmpdir(), 'yt-dlp-cache')].concat(extra);
+    if (YT_COOKIES) args.push('--cookies', YT_COOKIES);
+    args.push('https://www.youtube.com/watch?v=' + id);
+    execFile(YT_DLP, args, { timeout: 120000, maxBuffer: 64 * 1024 * 1024, env: process.env }, (err, stdout, stderr) => {
+      if (err) {
+        const e = new Error(
+          err.code === 'ENOENT'
+            ? 'yt-dlp が見つかりません (render.yaml のビルドコマンドで bin/yt-dlp を取得してください)'
+            : err.killed
+              ? 'yt-dlp がタイムアウトしました'
+              : ytCleanErr(stderr || err.message)
+        );
+        e.stderr = String(stderr || '');
+        return reject(e);
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch (e2) {
+        reject(new Error('yt-dlp の出力を解釈できませんでした'));
+      }
+    });
+  });
+}
+
+// yt-dlp の JSON から、ブラウザが直接再生できる (単一ファイルの https) 形式だけを取り出す
+function ytBuild(j) {
+  const fmts = []; // サーバー内部用 (URL を含む)
+  const list = []; // ブラウザへ返す (URL は含めない)
+  for (const f of j.formats || []) {
+    if (!f.url || (f.protocol !== 'https' && f.protocol !== 'http')) continue;
+    if (!/^(mp4|m4a|webm)$/.test(f.ext)) continue;
+    const hasV = !!f.vcodec && f.vcodec !== 'none';
+    const hasA = !!f.acodec && f.acodec !== 'none';
+    if (!hasV && !hasA) continue;
+    fmts.push({ url: f.url, ua: (f.http_headers && f.http_headers['User-Agent']) || YT_UA });
+    list.push({
+      i: fmts.length - 1,
+      k: hasV && hasA ? 'm' : hasV ? 'v' : 'a', // m=音声込み / v=映像のみ / a=音声のみ
+      h: f.height || 0,
+      fps: f.fps || 0,
+      ext: f.ext,
+      vc: hasV ? f.vcodec : '',
+      ac: hasA ? f.acodec : '',
+      abr: f.abr || 0,
+      lp: f.language_preference || 0 // 吹き替え音声より元の音声を優先するため
+    });
+  }
+  return {
+    fmts,
+    info: {
+      id: j.id,
+      title: j.title || '',
+      uploader: j.uploader || j.channel || '',
+      duration: j.duration || 0,
+      live: !!j.is_live,
+      formats: list
+    }
+  };
+}
+
+function ytGet(id) {
+  const c = ytCache.get(id);
+  if (c && Date.now() - c.t < YT_TTL) return Promise.resolve(c);
+  let p = ytJobs.get(id);
+  if (p) return p;
+  p = (async () => {
+    await ytAcquire();
+    try {
+      let j;
+      try {
+        j = await ytExec(id, YT_RT_ARGS);
+      } catch (e) {
+        // 古い yt-dlp は上のオプションを知らない → 付けずにやり直す
+        if (/no such option|unrecognized arguments/i.test(e.stderr || '')) j = await ytExec(id, []);
+        else throw e;
+      }
+      if (j.is_live) throw new Error('ライブ配信には未対応です');
+      const r = ytBuild(j);
+      if (!r.info.formats.length) throw new Error('再生できる形式が見つかりませんでした');
+      r.t = Date.now();
+      ytCache.set(id, r);
+      if (ytCache.size > 60) ytCache.delete(ytCache.keys().next().value);
+      return r;
+    } finally {
+      ytRelease();
+    }
+  })();
+  ytJobs.set(id, p);
+  const done = () => ytJobs.delete(id);
+  p.then(done, done);
+  return p;
+}
+
+// googlevideo の直リンクを、Range ごとそのままブラウザへ中継する
+function ytPipe(req, res, id, f, depth, u) {
+  const fail = (code, msg) => ytJson(res, code, { error: msg });
+  if (depth > 4 || !/^https?:$/.test(u.protocol) || hostBlocked(u.hostname)) return fail(502, '接続先を開けません');
+  const h = {
+    'user-agent': f.ua || YT_UA,
+    accept: '*/*',
+    'accept-encoding': 'identity',
+    'accept-language': req.headers['accept-language'] || 'en-US,en;q=0.9',
+    origin: 'https://www.youtube.com',
+    referer: 'https://www.youtube.com/'
+  };
+  if (req.headers.range) h.range = req.headers.range;
+  const isHttps = u.protocol === 'https:';
+  const up = (isHttps ? https : http).request(
+    {
+      hostname: u.hostname,
+      port: u.port || (isHttps ? 443 : 80),
+      path: u.pathname + u.search,
+      method: 'GET',
+      headers: h,
+      agent: isHttps ? httpsAgent : httpAgent
+    },
+    (ur) => {
+      const st = ur.statusCode;
+      if ([301, 302, 303, 307, 308].includes(st) && ur.headers.location) {
+        ur.resume();
+        let nu;
+        try {
+          nu = new URL(ur.headers.location, u);
+        } catch (e) {
+          return fail(502, 'リダイレクト先が不正です');
+        }
+        return ytPipe(req, res, id, f, depth + 1, nu);
+      }
+      if (st === 403 || st === 410) ytCache.delete(id); // 期限切れ / IP 不一致 → 次回は解決し直す
+      const oh = { 'cache-control': 'no-store', 'accept-ranges': 'bytes' };
+      for (const k of ['content-type', 'content-length', 'content-range', 'accept-ranges']) if (ur.headers[k]) oh[k] = ur.headers[k];
+      res.writeHead(st, oh);
+      ur.pipe(res);
+      ur.on('error', () => res.destroy());
+    }
+  );
+  up.setTimeout(30000, () => up.destroy(new Error('timeout')));
+  up.on('error', () => fail(502, '動画の取得に失敗しました'));
+  res.on('close', () => up.destroy());
+  up.end();
+}
+
+// EU 圏のサーバーから接続すると consent.youtube.com へ飛ばされるため、同意済みの Cookie を先に入れておく
+function seedYtCookies(sess) {
+  if (!sess || sess.ytSeeded) return;
+  sess.ytSeeded = true;
+  storeSetCookie(sess, 'SOCS=CAI; Domain=youtube.com; Path=/; Secure; Max-Age=31536000', new URL('https://www.youtube.com/'));
+}
+
+function ytParseT(s) {
+  if (!s) return 0;
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  const m = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?$/.exec(s);
+  return m ? (+(m[1] || 0)) * 3600 + (+(m[2] || 0)) * 60 + +(m[3] || 0) : 0;
+}
+
+// ページ移動としての「動画ページ」要求なら { id, t } を返す。?pxraw=1 を付けると本来のページを開く
+function ytWatchTarget(req, target) {
+  if (req.method !== 'GET' || target.searchParams.has('pxraw')) return null;
+  const host = target.hostname.toLowerCase();
+  let id = null;
+  if (/^(www\.|m\.)?youtube\.com$/.test(host)) {
+    if (target.pathname === '/watch') id = target.searchParams.get('v');
+    else {
+      const m = /^\/(?:shorts|live)\/([\w-]{11})/.exec(target.pathname);
+      if (m) id = m[1];
+    }
+  } else if (host === 'youtu.be') {
+    const m = /^\/([\w-]{11})/.exec(target.pathname);
+    if (m) id = m[1];
+  }
+  if (!id || !/^[\w-]{11}$/.test(id)) return null;
+  const dest = req.headers['sec-fetch-dest'];
+  const isNav = dest ? dest === 'document' || dest === 'iframe' : /text\/html/.test(req.headers.accept || '');
+  if (!isNav) return null; // SPA の裏側の fetch などは素通し
+  return { id, t: ytParseT(target.searchParams.get('t') || target.searchParams.get('start')) };
+}
+
+/* ---------- 専用プレーヤーのブラウザ側スクリプト ----------
+ *  yt-dlp の動画は「映像のみ」「音声のみ」に分かれていることが多いため、<video> と <audio> を同期させて再生する。
+ *  音声込みの形式 (360p など) がある場合は、画質の選択肢としてそれも出す。 */
+function ytViewerMain() {
+  var Y = window.__YT;
+  var $ = function (id) {
+    return document.getElementById(id);
+  };
+  var V = $('v'), A = $('a'), box = $('box'), msg = $('msg'), seek = $('seek');
+  var info = null, opts = [], split = false, dragging = false, hideTimer = null;
+  var noop = function () {};
+  var startAt = Y.t || 0;
+
+  V.poster = '/go/https/i.ytimg.com/vi/' + Y.id + '/hqdefault.jpg';
+  $('raw').href = '/go/https/www.youtube.com/watch?v=' + Y.id + '&pxraw=1';
+  $('home').href = '/go/https/www.youtube.com/';
+
+  function fmtT(s) {
+    s = Math.max(0, Math.floor(s || 0));
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+    return (h ? h + ':' + (m < 10 ? '0' : '') + m : m) + ':' + (x < 10 ? '0' : '') + x;
+  }
+  function showMsg(t, isErr) {
+    msg.textContent = t || '';
+    msg.className = isErr ? 'err' : '';
+    msg.style.display = t ? 'block' : 'none';
+  }
+  function src(i) {
+    return '/~/yt/s?v=' + Y.id + '&i=' + i;
+  }
+  function sup(el, type, codec) {
+    try {
+      return el.canPlayType(type + (codec ? '; codecs="' + codec + '"' : '')) !== '';
+    } catch (e) {
+      return false;
+    }
+  }
+  function vtype(f) {
+    return f.ext === 'webm' ? 'video/webm' : 'video/mp4';
+  }
+  function atype(f) {
+    return f.ext === 'webm' ? 'audio/webm' : 'audio/mp4';
+  }
+  function codecName(c) {
+    return /^avc1/.test(c) ? 'H.264' : /^vp0?9/.test(c) ? 'VP9' : /^av01/.test(c) ? 'AV1' : c;
+  }
+  function codecRank(c) {
+    return /^avc1/.test(c) ? 0 : /^vp0?9/.test(c) ? 1 : 2; // 互換性と軽さの順
+  }
+
+  /* ----- 画質の選択肢を作る ----- */
+  function build(fs) {
+    var vids = [], auds = [], mux = [];
+    fs.forEach(function (f) {
+      if (f.k === 'v' && sup(V, vtype(f), f.vc)) vids.push(f);
+      else if (f.k === 'a' && sup(A, atype(f), f.ac)) auds.push(f);
+      else if (f.k === 'm' && sup(V, vtype(f), f.vc + ', ' + f.ac)) mux.push(f);
+    });
+    auds.sort(function (x, y) {
+      return y.lp - x.lp || y.abr - x.abr;
+    });
+    vids.sort(function (x, y) {
+      return y.h - x.h || y.fps - x.fps || codecRank(x.vc) - codecRank(y.vc);
+    });
+    function audioFor(vf) {
+      var want = vf.ext === 'webm' ? 'webm' : 'm4a';
+      for (var i = 0; i < auds.length; i++) if (auds[i].ext === want) return auds[i];
+      return auds[0] || null;
+    }
+    var seen = {}, out = [];
+    vids.forEach(function (f) {
+      var key = f.h + 'p' + (f.fps > 30 ? f.fps : '');
+      if (seen[key]) return;
+      var a = audioFor(f);
+      if (!a) return;
+      seen[key] = 1;
+      out.push({ label: key + ' (' + codecName(f.vc) + ')', h: f.h, v: f.i, a: a.i });
+    });
+    mux.sort(function (x, y) {
+      return y.h - x.h;
+    });
+    mux.forEach(function (f) {
+      out.push({ label: f.h + 'p 音声込み (' + codecName(f.vc) + ')', h: f.h, v: f.i, a: null });
+    });
+    return out;
+  }
+
+  /* ----- 読み込み / 画質切り替え ----- */
+  function load(opt, keep) {
+    var t = keep ? V.currentTime : startAt;
+    var wasPlaying = keep && !V.paused;
+    split = opt.a !== null;
+    showMsg('読み込み中…');
+    V.src = src(opt.v);
+    if (split) {
+      A.src = src(opt.a);
+    } else {
+      A.removeAttribute('src');
+      try {
+        A.load();
+      } catch (e) {}
+    }
+    V.onloadedmetadata = function () {
+      try {
+        if (t > 0) V.currentTime = t;
+      } catch (e) {}
+      showMsg('');
+      if (wasPlaying) play();
+      ui();
+    };
+    A.onloadedmetadata = function () {
+      try {
+        A.currentTime = V.currentTime || t;
+      } catch (e) {}
+    };
+  }
+
+  /* ----- 再生制御 (映像を主、音声を従として同期) ----- */
+  function play() {
+    var p = V.play();
+    if (p && p.catch)
+      p.catch(function (e) {
+        showMsg('再生できません: ' + e.message, true);
+      });
+  }
+  function toggle() {
+    if (V.paused) play();
+    else V.pause();
+  }
+  function seekBy(s) {
+    var d = V.duration || (info && info.duration) || 0;
+    V.currentTime = Math.max(0, Math.min(d || 1e9, V.currentTime + s));
+  }
+  V.addEventListener('play', function () {
+    if (split) {
+      try {
+        A.currentTime = V.currentTime;
+      } catch (e) {}
+      var p = A.play();
+      if (p && p.catch) p.catch(noop);
+    }
+    ui();
+  });
+  V.addEventListener('pause', function () {
+    if (split) A.pause();
+    ui();
+  });
+  V.addEventListener('waiting', function () {
+    if (split) A.pause();
+    showMsg('バッファ中…');
+  });
+  V.addEventListener('playing', function () {
+    showMsg('');
+    if (split && A.paused) {
+      try {
+        A.currentTime = V.currentTime;
+      } catch (e) {}
+      var p = A.play();
+      if (p && p.catch) p.catch(noop);
+    }
+  });
+  V.addEventListener('seeking', function () {
+    if (split) {
+      try {
+        A.currentTime = V.currentTime;
+      } catch (e) {}
+    }
+  });
+  V.addEventListener('ratechange', function () {
+    A.playbackRate = V.playbackRate;
+  });
+  V.addEventListener('timeupdate', ui);
+  V.addEventListener('ended', ui);
+  V.addEventListener('error', function () {
+    showMsg('動画を読み込めませんでした (code ' + (V.error ? V.error.code : '?') + ')。別の画質を試すか、時間をおいて再読み込みしてください。', true);
+  });
+  A.addEventListener('error', function () {
+    if (split) showMsg('音声を読み込めませんでした。別の画質を試してください。', true);
+  });
+  // 音声と映像のずれを補正
+  setInterval(function () {
+    if (split && !V.paused && !V.seeking && !A.seeking && A.readyState >= 2 && Math.abs(A.currentTime - V.currentTime) > 0.3) {
+      try {
+        A.currentTime = V.currentTime;
+      } catch (e) {}
+    }
+  }, 500);
+
+  /* ----- コントロール ----- */
+  function ui() {
+    var d = V.duration || (info && info.duration) || 0;
+    $('t').textContent = fmtT(V.currentTime) + ' / ' + fmtT(d);
+    if (!dragging && d) seek.value = Math.round((V.currentTime / d) * 1000);
+    $('pp').textContent = V.paused ? '▶' : '❚❚';
+    box.classList.toggle('paused', V.paused);
+    $('mute').textContent = V.muted || V.volume === 0 ? '🔇' : '🔊';
+  }
+  function setVol(v, m) {
+    V.volume = A.volume = v;
+    V.muted = A.muted = m;
+    $('vol').value = v;
+    try {
+      localStorage.setItem('yt_vol', JSON.stringify([v, m]));
+    } catch (e) {}
+    ui();
+  }
+  function fullscreen() {
+    var d = document;
+    if (d.fullscreenElement || d.webkitFullscreenElement) {
+      (d.exitFullscreen || d.webkitExitFullscreen).call(d);
+    } else {
+      var r = box.requestFullscreen || box.webkitRequestFullscreen;
+      if (r) r.call(box);
+    }
+  }
+  function poke() {
+    box.classList.add('show');
+    clearTimeout(hideTimer);
+    hideTimer = setTimeout(function () {
+      if (!V.paused) box.classList.remove('show');
+    }, 2500);
+  }
+  seek.addEventListener('input', function () {
+    dragging = true;
+    var d = V.duration || (info && info.duration) || 0;
+    $('t').textContent = fmtT((seek.value / 1000) * d) + ' / ' + fmtT(d);
+  });
+  seek.addEventListener('change', function () {
+    var d = V.duration || (info && info.duration) || 0;
+    if (d) V.currentTime = (seek.value / 1000) * d;
+    dragging = false;
+  });
+  $('pp').addEventListener('click', toggle);
+  $('big').addEventListener('click', toggle);
+  V.addEventListener('click', toggle);
+  V.addEventListener('dblclick', fullscreen);
+  $('fs').addEventListener('click', fullscreen);
+  $('mute').addEventListener('click', function () {
+    setVol(V.volume || 1, !V.muted);
+  });
+  $('vol').addEventListener('input', function () {
+    setVol(parseFloat($('vol').value), false);
+  });
+  $('rate').addEventListener('change', function () {
+    V.playbackRate = parseFloat($('rate').value);
+  });
+  $('q').addEventListener('change', function () {
+    load(opts[parseInt($('q').value, 10)], true);
+  });
+  box.addEventListener('mousemove', poke);
+  box.addEventListener('touchstart', poke, { passive: true });
+  document.addEventListener('keydown', function (ev) {
+    var tg = ev.target && ev.target.tagName;
+    if (tg === 'SELECT' || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    var k = ev.key, used = true;
+    if (k === ' ' || k === 'k') toggle();
+    else if (k === 'ArrowLeft') seekBy(-5);
+    else if (k === 'ArrowRight') seekBy(5);
+    else if (k === 'ArrowUp') setVol(Math.min(1, V.volume + 0.05), false);
+    else if (k === 'ArrowDown') setVol(Math.max(0, V.volume - 0.05), false);
+    else if (k === 'f') fullscreen();
+    else if (k === 'm') setVol(V.volume || 1, !V.muted);
+    else used = false;
+    if (used) {
+      ev.preventDefault();
+      poke();
+    }
+  });
+  try {
+    var sv = JSON.parse(localStorage.getItem('yt_vol') || 'null');
+    if (sv) setVol(sv[0], !!sv[1]);
+  } catch (e) {}
+
+  /* ----- 動画情報の取得 ----- */
+  showMsg('動画情報を取得中… (初回は 10〜30 秒ほどかかります)');
+  fetch('/~/yt/info?v=' + encodeURIComponent(Y.id), { credentials: 'same-origin' })
+    .then(function (r) {
+      return r.json().then(function (j) {
+        if (!r.ok || j.error) throw new Error(j.error || 'HTTP ' + r.status);
+        return j;
+      });
+    })
+    .then(function (j) {
+      info = j;
+      $('title').textContent = j.title;
+      $('up').textContent = j.uploader + (j.duration ? ' ・ ' + fmtT(j.duration) : '');
+      document.title = j.title + ' - YouTube';
+      opts = build(j.formats);
+      if (!opts.length) throw new Error('このブラウザで再生できる形式がありませんでした');
+      var q = $('q'), def = 0;
+      opts.forEach(function (o, i) {
+        var e = document.createElement('option');
+        e.value = i;
+        e.textContent = o.label;
+        q.appendChild(e);
+      });
+      for (var i = 0; i < opts.length; i++) {
+        if (opts[i].a !== null && opts[i].h <= 1080) {
+          def = i;
+          break;
+        }
+      }
+      q.value = def;
+      load(opts[def], false);
+      showMsg('');
+      ui();
+      poke();
+    })
+    .catch(function (e) {
+      $('title').textContent = '動画を再生できません';
+      showMsg(e.message, true);
+      $('hint').style.display = 'block';
+    });
+  ui();
+}
+
+const YT_VIEWER_HTML = `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>YouTube</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  html,body{margin:0;min-height:100%;background:#0f1117;color:#e8eaf0;
+    font-family:system-ui,-apple-system,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif}
+  #wrap{max-width:1200px;margin:0 auto;padding:12px}
+  #box{position:relative;width:100%;aspect-ratio:16/9;max-height:calc(100vh - 150px);background:#000;border-radius:10px;overflow:hidden;margin:0 auto}
+  #box:fullscreen{max-height:none;border-radius:0}
+  #v{width:100%;height:100%;object-fit:contain;display:block;background:#000}
+  #big{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:72px;height:72px;border-radius:50%;
+    background:rgba(0,0,0,.6);display:none;align-items:center;justify-content:center;font-size:30px;cursor:pointer}
+  #box.paused #big{display:flex}
+  #msg{position:absolute;left:12px;right:12px;top:12px;padding:8px 12px;border-radius:8px;background:rgba(0,0,0,.7);font-size:13px;line-height:1.5}
+  #msg.err{background:rgba(198,40,40,.9)}
+  .ctl{position:absolute;left:0;right:0;bottom:0;padding:18px 10px 8px;background:linear-gradient(transparent,rgba(0,0,0,.85));
+    opacity:0;transition:opacity .2s}
+  #box.show .ctl,#box.paused .ctl,.ctl:hover{opacity:1}
+  .row{display:flex;align-items:center;gap:8px;font-size:13px}
+  .row .sp{flex:1}
+  .row button{width:34px;height:30px;border:0;border-radius:6px;background:transparent;color:#fff;font-size:16px;cursor:pointer}
+  .row button:hover{background:rgba(255,255,255,.18)}
+  .row select{background:#222;color:#fff;border:1px solid #444;border-radius:6px;padding:3px 4px;font-size:12px}
+  input[type=range]{accent-color:#ff3b3b}
+  #seek{width:100%;margin:0 0 4px}
+  #vol{width:70px}
+  h1{font-size:18px;font-weight:600;margin:14px 2px 4px}
+  #up{color:#aab0c0;font-size:13px;margin:0 2px 10px}
+  .links{font-size:13px;margin:0 2px;color:#8a90a2}
+  .links a{color:#8fb0ff;text-decoration:none}
+  .links a:hover{text-decoration:underline}
+  #hint{display:none;margin:14px 2px;font-size:12px;line-height:1.7;color:#aab0c0}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="box" class="paused show">
+    <video id="v" playsinline preload="metadata"></video>
+    <audio id="a" preload="auto"></audio>
+    <div id="big">&#9654;</div>
+    <div id="msg" style="display:none"></div>
+    <div class="ctl">
+      <input id="seek" type="range" min="0" max="1000" value="0">
+      <div class="row">
+        <button id="pp" title="再生 / 一時停止 (Space)">&#9654;</button>
+        <span id="t">0:00 / 0:00</span>
+        <span class="sp"></span>
+        <button id="mute" title="ミュート (M)">&#128266;</button>
+        <input id="vol" type="range" min="0" max="1" step="0.05" value="1">
+        <select id="rate" title="再生速度">
+          <option value="0.5">0.5x</option><option value="0.75">0.75x</option><option value="1" selected>1x</option>
+          <option value="1.25">1.25x</option><option value="1.5">1.5x</option><option value="2">2x</option>
+        </select>
+        <select id="q" title="画質"></select>
+        <button id="fs" title="全画面 (F)">&#9974;</button>
+      </div>
+    </div>
+  </div>
+  <h1 id="title">読み込み中…</h1>
+  <div id="up"></div>
+  <div class="links"><a id="home">YouTube トップ</a> ・ <a id="raw">通常ページで開く</a></div>
+  <div id="hint">
+    「ボットではないことを確認」などと出る場合は、サーバー (Render) の IP が YouTube に制限されています。
+    環境変数 YT_COOKIES_FILE に cookies.txt を設定すると改善することがあります。
+  </div>
+</div>
+<script>window.__YT=__CFG__;</script>
+<script>(${ytViewerMain.toString()})();</script>
+</body>
+</html>`;
+
+function serveYtViewer(res, id, t) {
+  const cfg = JSON.stringify({ id, t }).replace(/</g, '\\u003c');
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(YT_VIEWER_HTML.replace('__CFG__', () => cfg));
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const path = req.url.split('?')[0];
@@ -2158,6 +2854,28 @@ const server = http.createServer(async (req, res) => {
       });
       return res.end(SHELL_HTML);
     }
+    if (path === '/~/yt/info' || path === '/~/yt/s') {
+      const qs = new URL(req.url, 'http://x').searchParams;
+      const id = qs.get('v') || '';
+      if (!/^[\w-]{11}$/.test(id)) return ytJson(res, 400, { error: '動画 ID が正しくありません' });
+      if (path === '/~/yt/info') {
+        ytGet(id).then(
+          (r) => ytJson(res, 200, r.info),
+          (e) => ytJson(res, 502, { error: e.message })
+        );
+        return;
+      }
+      const idx = parseInt(qs.get('i'), 10);
+      ytGet(id).then(
+        (r) => {
+          const f = r.fmts[idx];
+          if (!f) return ytJson(res, 404, { error: '形式が見つかりません' });
+          ytPipe(req, res, id, f, 0, new URL(f.url));
+        },
+        (e) => ytJson(res, 502, { error: e.message })
+      );
+      return;
+    }
     if (path === '/~/cookie' && req.method === 'POST') {
       const body = JSON.parse((await readBody(req, 16384)) || '{}');
       const u = new URL(String(body.url));
@@ -2180,6 +2898,9 @@ const server = http.createServer(async (req, res) => {
       if (!target) return errorPage(res, 400, 'URL が正しくありません');
       if (target.host.toLowerCase() === String(req.headers.host).toLowerCase()) return errorPage(res, 400, '自分自身へのアクセスはできません');
       if (hostBlocked(target.hostname)) return errorPage(res, 403, 'このアドレスへは接続できません');
+      // YouTube の動画ページは、専用プレーヤー (yt-dlp 経由) に差し替える
+      const yt = ytWatchTarget(req, target);
+      if (yt) return serveYtViewer(res, yt.id, yt.t);
       return handleProxy(req, res, target);
     }
 
