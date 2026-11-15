@@ -1458,6 +1458,7 @@ const INDEX_HTML = `<!doctype html>
   </form>
   <label class="chk"><input type="checkbox" id="c"> 履歴を残さない (about:blank で表示)</label>
   <p id="s" class="st"></p>
+  <p style="margin:18px 0 0;font-size:14px"><a href="/~/yt" style="color:#8fb0ff;text-decoration:none">&#9654; YouTube 検索モード (yt-dlp)</a></p>
   <noscript>JavaScript を有効にしてください。</noscript>
 </main>
 <footer>
@@ -2215,11 +2216,11 @@ function ytCleanErr(s) {
   return (err.length ? err.slice(-2) : lines.slice(-2)).join(' ').slice(0, 500) || 'yt-dlp が失敗しました';
 }
 
-function ytExec(id, extra) {
+function ytExec(target, extra) {
   return new Promise((resolve, reject) => {
-    const args = ['-J', '--no-playlist', '--no-warnings', '--socket-timeout', '20', '--cache-dir', pathMod.join(os.tmpdir(), 'yt-dlp-cache')].concat(extra);
+    const args = ['-J', '--no-warnings', '--socket-timeout', '20', '--cache-dir', pathMod.join(os.tmpdir(), 'yt-dlp-cache')].concat(extra);
     if (YT_COOKIES) args.push('--cookies', YT_COOKIES);
-    args.push('https://www.youtube.com/watch?v=' + id);
+    args.push(target);
     execFile(YT_DLP, args, { timeout: 120000, maxBuffer: 64 * 1024 * 1024, env: process.env }, (err, stdout, stderr) => {
       if (err) {
         const e = new Error(
@@ -2277,32 +2278,58 @@ function ytBuild(j) {
   };
 }
 
+// yt-dlp を同時実行数の上限内で実行する (動画の解決・検索で共用)
+async function ytRun(target, extra) {
+  await ytAcquire();
+  try {
+    try {
+      return await ytExec(target, extra.concat(YT_RT_ARGS));
+    } catch (e) {
+      // 古い yt-dlp は JS ランタイム用のオプションを知らない → 付けずにやり直す
+      if (/no such option|unrecognized arguments/i.test(e.stderr || '')) return await ytExec(target, extra);
+      throw e;
+    }
+  } finally {
+    ytRelease();
+  }
+}
+
+// 検索: yt-dlp の ytsearchN: を使う (--flat-playlist で一覧だけ高速に取得)
+const ytSearchCache = new Map(); // "n:query" -> { t, items }
+async function ytSearch(q, n) {
+  const key = n + ':' + q.toLowerCase();
+  const c = ytSearchCache.get(key);
+  if (c && Date.now() - c.t < 10 * 60 * 1000) return c.items;
+  const j = await ytRun('ytsearch' + n + ':' + q, ['--flat-playlist']);
+  const items = (j.entries || [])
+    .filter((e) => e && /^[\w-]{11}$/.test(e.id || ''))
+    .map((e) => ({
+      id: e.id,
+      title: e.title || '',
+      by: e.channel || e.uploader || '',
+      dur: e.duration || 0,
+      views: e.view_count || 0,
+      live: e.live_status === 'is_live'
+    }));
+  ytSearchCache.set(key, { t: Date.now(), items });
+  if (ytSearchCache.size > 60) ytSearchCache.delete(ytSearchCache.keys().next().value);
+  return items;
+}
+
 function ytGet(id) {
   const c = ytCache.get(id);
   if (c && Date.now() - c.t < YT_TTL) return Promise.resolve(c);
   let p = ytJobs.get(id);
   if (p) return p;
   p = (async () => {
-    await ytAcquire();
-    try {
-      let j;
-      try {
-        j = await ytExec(id, YT_RT_ARGS);
-      } catch (e) {
-        // 古い yt-dlp は上のオプションを知らない → 付けずにやり直す
-        if (/no such option|unrecognized arguments/i.test(e.stderr || '')) j = await ytExec(id, []);
-        else throw e;
-      }
-      if (j.is_live) throw new Error('ライブ配信には未対応です');
-      const r = ytBuild(j);
-      if (!r.info.formats.length) throw new Error('再生できる形式が見つかりませんでした');
-      r.t = Date.now();
-      ytCache.set(id, r);
-      if (ytCache.size > 60) ytCache.delete(ytCache.keys().next().value);
-      return r;
-    } finally {
-      ytRelease();
-    }
+    const j = await ytRun('https://www.youtube.com/watch?v=' + id, ['--no-playlist']);
+    if (j.is_live) throw new Error('ライブ配信には未対応です');
+    const r = ytBuild(j);
+    if (!r.info.formats.length) throw new Error('再生できる形式が見つかりませんでした');
+    r.t = Date.now();
+    ytCache.set(id, r);
+    if (ytCache.size > 60) ytCache.delete(ytCache.keys().next().value);
+    return r;
   })();
   ytJobs.set(id, p);
   const done = () => ytJobs.delete(id);
@@ -2410,7 +2437,7 @@ function ytViewerMain() {
 
   V.poster = '/go/https/i.ytimg.com/vi/' + Y.id + '/hqdefault.jpg';
   $('raw').href = '/go/https/www.youtube.com/watch?v=' + Y.id + '&pxraw=1';
-  $('home').href = '/go/https/www.youtube.com/';
+  $('home').href = '/~/yt';
 
   function fmtT(s) {
     s = Math.max(0, Math.floor(s || 0));
@@ -2648,7 +2675,7 @@ function ytViewerMain() {
   box.addEventListener('touchstart', poke, { passive: true });
   document.addEventListener('keydown', function (ev) {
     var tg = ev.target && ev.target.tagName;
-    if (tg === 'SELECT' || ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    if (tg === 'SELECT' || tg === 'TEXTAREA' || (tg === 'INPUT' && ev.target.type === 'text') || ev.ctrlKey || ev.metaKey || ev.altKey) return;
     var k = ev.key, used = true;
     if (k === ' ' || k === 'k') toggle();
     else if (k === 'ArrowLeft') seekBy(-5);
@@ -2724,6 +2751,10 @@ const YT_VIEWER_HTML = `<!doctype html>
   html,body{margin:0;min-height:100%;background:#0f1117;color:#e8eaf0;
     font-family:system-ui,-apple-system,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif}
   #wrap{max-width:1200px;margin:0 auto;padding:12px}
+  #sf{display:flex;gap:8px;margin:0 0 10px}
+  #sf input{flex:1;min-width:0;padding:9px 14px;font-size:14px;border-radius:20px;border:1px solid #2b3040;background:#171a23;color:inherit;outline:none}
+  #sf input:focus{border-color:#5b8cff}
+  #sf button{padding:0 16px;border:0;border-radius:20px;background:#5b8cff;color:#fff;cursor:pointer}
   #box{position:relative;width:100%;aspect-ratio:16/9;max-height:calc(100vh - 150px);background:#000;border-radius:10px;overflow:hidden;margin:0 auto}
   #box:fullscreen{max-height:none;border-radius:0}
   #v{width:100%;height:100%;object-fit:contain;display:block;background:#000}
@@ -2753,6 +2784,7 @@ const YT_VIEWER_HTML = `<!doctype html>
 </head>
 <body>
 <div id="wrap">
+  <form id="sf" action="/~/yt" method="get"><input name="q" placeholder="YouTube を検索" autocomplete="off"><button type="submit">検索</button></form>
   <div id="box" class="paused show">
     <video id="v" playsinline preload="metadata"></video>
     <audio id="a" preload="auto"></audio>
@@ -2777,7 +2809,7 @@ const YT_VIEWER_HTML = `<!doctype html>
   </div>
   <h1 id="title">読み込み中…</h1>
   <div id="up"></div>
-  <div class="links"><a id="home">YouTube トップ</a> ・ <a id="raw">通常ページで開く</a></div>
+  <div class="links"><a id="home">検索に戻る</a> ・ <a id="raw">通常ページで開く</a></div>
   <div id="hint">
     「ボットではないことを確認」などと出る場合は、サーバー (Render) の IP が YouTube に制限されています。
     環境変数 YT_COOKIES_FILE に cookies.txt を設定すると改善することがあります。
@@ -2785,6 +2817,207 @@ const YT_VIEWER_HTML = `<!doctype html>
 </div>
 <script>window.__YT=__CFG__;</script>
 <script>(${ytViewerMain.toString()})();</script>
+</body>
+</html>`;
+
+/* ---------- YouTube 検索モードのページ (/~/yt) ---------- */
+function ytHomeMain() {
+  var $ = function (id) {
+    return document.getElementById(id);
+  };
+  var form = $('f'), inp = $('q'), list = $('list'), more = $('more'), st = $('st'), hist = $('hist');
+  var cur = { q: '', n: 20 };
+
+  function fmtT(s) {
+    s = Math.max(0, Math.floor(s || 0));
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+    return (h ? h + ':' + (m < 10 ? '0' : '') + m : m) + ':' + (x < 10 ? '0' : '') + x;
+  }
+  function fmtV(n) {
+    if (!n) return '';
+    if (n >= 1e8) return (n / 1e8).toFixed(1) + '億回視聴';
+    if (n >= 1e4) return (n / 1e4).toFixed(n >= 1e5 ? 0 : 1) + '万回視聴';
+    return n + '回視聴';
+  }
+  // YouTube の URL が貼られたら、検索せずそのまま再生ページへ
+  function idFromUrl(s) {
+    var m = /(?:youtu\.be\/|[?&]v=|\/shorts\/|\/live\/|\/embed\/)([\w-]{11})/.exec(s);
+    return /youtu/i.test(s) && m ? m[1] : null;
+  }
+  function getHist() {
+    try {
+      return JSON.parse(localStorage.getItem('yt_hist') || '[]');
+    } catch (e) {
+      return [];
+    }
+  }
+  function addHist(q) {
+    try {
+      var h = getHist().filter(function (x) {
+        return x !== q;
+      });
+      h.unshift(q);
+      localStorage.setItem('yt_hist', JSON.stringify(h.slice(0, 10)));
+    } catch (e) {}
+  }
+  function showHist() {
+    hist.textContent = '';
+    getHist().forEach(function (q) {
+      var a = document.createElement('a');
+      a.href = '/~/yt?q=' + encodeURIComponent(q);
+      a.textContent = q;
+      a.className = 'chip';
+      a.addEventListener('click', function (ev) {
+        ev.preventDefault();
+        go(q);
+      });
+      hist.appendChild(a);
+    });
+  }
+  function card(it) {
+    var a = document.createElement('a');
+    a.className = 'card';
+    a.href = '/go/https/www.youtube.com/watch?v=' + it.id;
+    var th = document.createElement('div');
+    th.className = 'th';
+    var im = document.createElement('img');
+    im.loading = 'lazy';
+    im.alt = '';
+    im.src = '/go/https/i.ytimg.com/vi/' + it.id + '/mqdefault.jpg';
+    th.appendChild(im);
+    var d = document.createElement('span');
+    d.className = 'dur';
+    d.textContent = it.live ? 'LIVE' : it.dur ? fmtT(it.dur) : '';
+    if (d.textContent) th.appendChild(d);
+    var t = document.createElement('div');
+    t.className = 'ti';
+    t.textContent = it.title;
+    var s = document.createElement('div');
+    s.className = 'sub';
+    s.textContent = [it.by, fmtV(it.views)].filter(Boolean).join(' ・ ');
+    a.appendChild(th);
+    a.appendChild(t);
+    a.appendChild(s);
+    return a;
+  }
+  function search(q, n) {
+    cur = { q: q, n: n };
+    inp.value = q;
+    st.className = 'st';
+    st.textContent = '検索中… (初回は 10〜20 秒ほどかかることがあります)';
+    more.style.display = 'none';
+    if (n === 20) list.textContent = '';
+    hist.style.display = 'none';
+    document.title = q + ' - YouTube 検索';
+    fetch('/~/yt/search?q=' + encodeURIComponent(q) + '&n=' + n, { credentials: 'same-origin' })
+      .then(function (r) {
+        return r.json().then(function (j) {
+          if (!r.ok || j.error) throw new Error(j.error || 'HTTP ' + r.status);
+          return j;
+        });
+      })
+      .then(function (j) {
+        if (cur.q !== q || cur.n !== n) return; // 古い応答は捨てる
+        list.textContent = '';
+        j.items.forEach(function (it) {
+          list.appendChild(card(it));
+        });
+        st.textContent = j.items.length ? '' : '見つかりませんでした';
+        more.style.display = j.items.length >= n && n < 60 ? 'block' : 'none';
+      })
+      .catch(function (e) {
+        if (cur.q !== q || cur.n !== n) return;
+        st.className = 'st err';
+        st.textContent = '検索に失敗しました: ' + e.message;
+      });
+  }
+  function go(q) {
+    var id = idFromUrl(q);
+    if (id) {
+      location.href = '/go/https/www.youtube.com/watch?v=' + id;
+      return;
+    }
+    addHist(q);
+    try {
+      history.pushState(null, '', '/~/yt?q=' + encodeURIComponent(q));
+    } catch (e) {}
+    search(q, 20);
+  }
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var q = inp.value.trim();
+    if (q) go(q);
+  });
+  more.addEventListener('click', function () {
+    search(cur.q, Math.min(60, cur.n + 20));
+  });
+  function fromUrl() {
+    var q = (new URLSearchParams(location.search).get('q') || '').trim();
+    if (q) search(q, 20);
+    else {
+      cur = { q: '', n: 20 };
+      list.textContent = '';
+      st.textContent = '';
+      more.style.display = 'none';
+      inp.value = '';
+      document.title = 'YouTube 検索';
+      hist.style.display = 'flex';
+      showHist();
+    }
+  }
+  window.addEventListener('popstate', fromUrl);
+  fromUrl();
+}
+
+const YT_HOME_HTML = `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>YouTube 検索</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  html,body{margin:0;min-height:100%;background:#0f1117;color:#e8eaf0;
+    font-family:system-ui,-apple-system,"Segoe UI","Hiragino Sans","Noto Sans JP",sans-serif}
+  #wrap{max-width:1200px;margin:0 auto;padding:14px}
+  form{display:flex;gap:8px;max-width:720px;margin:0 auto 14px}
+  input{flex:1;min-width:0;padding:11px 16px;font-size:16px;border-radius:24px;border:1px solid #2b3040;background:#171a23;color:inherit;outline:none}
+  input:focus{border-color:#5b8cff;box-shadow:0 0 0 3px rgba(91,140,255,.25)}
+  button.go{padding:0 22px;font-size:15px;border:0;border-radius:24px;background:#5b8cff;color:#fff;cursor:pointer}
+  .st{min-height:1.4em;text-align:center;font-size:13px;color:#aab0c0;margin:6px 0 12px}
+  .st.err{color:#ff8a80}
+  #hist{display:none;flex-wrap:wrap;gap:8px;justify-content:center;max-width:720px;margin:0 auto}
+  .chip{padding:6px 12px;border-radius:16px;background:#1d2130;color:#cfd5e6;font-size:13px;text-decoration:none}
+  .chip:hover{background:#2a3050}
+  #list{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:18px 14px}
+  .card{display:block;color:inherit;text-decoration:none}
+  .th{position:relative;aspect-ratio:16/9;background:#1d2130;border-radius:10px;overflow:hidden}
+  .th img{width:100%;height:100%;object-fit:cover;display:block}
+  .dur{position:absolute;right:6px;bottom:6px;padding:1px 6px;border-radius:4px;background:rgba(0,0,0,.8);font-size:12px}
+  .ti{margin:8px 2px 2px;font-size:14px;line-height:1.4;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .card:hover .ti{color:#8fb0ff}
+  .sub{margin:0 2px;font-size:12px;color:#8a90a2}
+  #more{display:none;margin:22px auto;padding:10px 28px;border:0;border-radius:20px;background:#242938;color:#e8eaf0;font-size:14px;cursor:pointer}
+  #more:hover{background:#2f3550}
+  footer{text-align:center;font-size:12px;color:#8a90a2;margin:26px 0 8px}
+  footer a{color:#8fb0ff;text-decoration:none}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <form id="f" autocomplete="off">
+    <input id="q" type="text" placeholder="YouTube を検索 / 動画の URL を貼り付け" autofocus>
+    <button class="go" type="submit">検索</button>
+  </form>
+  <div id="hist"></div>
+  <p id="st" class="st"></p>
+  <div id="list"></div>
+  <button id="more">もっと見る</button>
+  <footer><a href="/">トップへ戻る</a></footer>
+</div>
+<script>(${ytHomeMain.toString()})();</script>
 </body>
 </html>`;
 
@@ -2853,6 +3086,21 @@ const server = http.createServer(async (req, res) => {
         'content-security-policy': SHELL_CSP
       });
       return res.end(SHELL_HTML);
+    }
+    if (path === '/~/yt') {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      return res.end(YT_HOME_HTML);
+    }
+    if (path === '/~/yt/search') {
+      const qs = new URL(req.url, 'http://x').searchParams;
+      const q = (qs.get('q') || '').trim().slice(0, 200);
+      const n = Math.min(60, Math.max(10, parseInt(qs.get('n'), 10) || 20));
+      if (!q) return ytJson(res, 400, { error: '検索ワードを入力してください' });
+      ytSearch(q, n).then(
+        (items) => ytJson(res, 200, { items }),
+        (e) => ytJson(res, 502, { error: e.message })
+      );
+      return;
     }
     if (path === '/~/yt/info' || path === '/~/yt/s') {
       const qs = new URL(req.url, 'http://x').searchParams;
